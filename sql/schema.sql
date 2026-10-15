@@ -60,6 +60,7 @@ DROP FUNCTION IF EXISTS pgshadow.snapshot();
 DROP FUNCTION IF EXISTS pgshadow.table_state(text[], text[], text[]);
 DROP FUNCTION IF EXISTS pgshadow.validate(int[], oid[], text[], text[], text[], text[], text[]);
 DROP FUNCTION IF EXISTS pgshadow.validate(int[], oid[], text[], text[], text[], text[], text[], text[], text[], text[]);
+DROP FUNCTION IF EXISTS pgshadow.validate(int[], oid[], text[], text[], text[], text[], text[], text[], text[], text[], text[]);
 DROP FUNCTION IF EXISTS pgshadow.type_fp(oid);
 DROP FUNCTION IF EXISTS pgshadow.fill_context();
 REVOKE ALL ON SCHEMA pgshadow FROM PUBLIC;
@@ -98,12 +99,17 @@ BEGIN
     END IF;
 END $do$;
 
+-- Internal helpers below (type_fp, rel_state, effective_schemas, resolve_rel,
+-- catalog_epoch, settings_hash) have no SET search_path of their own: they run inside
+-- validate(), table_state(), fill_context() and enable(), which pin it, and changing it on
+-- every nested call made each check ~20% slower.
+
 -- A column type's definition as it affects output, followed through composite
 -- attributes, array elements, domain bases and range subtypes: the type rows, attribute
 -- names, and exact enum labels and their order. Built-in scalar types stop the walk.
 -- Nesting deeper than 8 levels yields NULL, which makes the table ineligible.
 CREATE OR REPLACE FUNCTION pgshadow.type_fp(p_type oid, p_depth int DEFAULT 0) RETURNS text
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql STABLE AS $$
 DECLARE
     t    record;
     out  text;
@@ -150,7 +156,7 @@ END $$;
 -- table's ACL, and (hypertables) its chunks. DDL rewrites the relevant catalog rows,
 -- which changes their xmin.
 CREATE OR REPLACE FUNCTION pgshadow.rel_state(p_rel oid, OUT eligible boolean, OUT fp text, OUT reason text)
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql STABLE AS $$
 DECLARE
     c        record;
     trig     text;
@@ -227,7 +233,7 @@ $$;
 -- has no USAGE on skipped, pg_catalog first unless listed. (Sessions with temporary
 -- relations are never cached, so pg_temp is ignored.)
 CREATE OR REPLACE FUNCTION pgshadow.effective_schemas(p_path text, p_role text) RETURNS text[]
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql STABLE AS $$
 DECLARE
     item     text;
     out      text[] := '{}';
@@ -281,7 +287,7 @@ $$;
 
 -- Resolve a relation reference the way a session with this search_path and role would.
 CREATE OR REPLACE FUNCTION pgshadow.resolve_rel(p_nsp text, p_name text, p_path text, p_role text) RETURNS oid
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql STABLE AS $$
 DECLARE
     r oid;
 BEGIN
@@ -300,7 +306,7 @@ END $$;
 -- without the result being discarded. (Table row types and array types are left out:
 -- table changes are tracked per table, and creating tables must not invalidate.)
 CREATE OR REPLACE FUNCTION pgshadow.catalog_epoch() RETURNS text
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql STABLE AS $$
 DECLARE
     f text; o text; t text; c text; l text;
 BEGIN
@@ -324,11 +330,13 @@ END $$;
 -- connections do not override any of them), plus this server's boot token. A
 -- configuration reload changes them for every session without telling the client; the
 -- proxy then re-reads each session's settings before using the cache again.
--- NULL during recovery (hot standby): nothing is cached there.
+-- Must be called at the top level of the proxy's queries (inside a function that pins
+-- search_path it would see that instead). NULL during recovery (hot standby) and while
+-- there is no boot token: then nothing is cached or served.
 CREATE OR REPLACE FUNCTION pgshadow.settings_hash() RETURNS text
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql STABLE AS $$
 BEGIN
-    IF pg_is_in_recovery() THEN
+    IF pg_is_in_recovery() OR NOT EXISTS (SELECT 1 FROM pgshadow.boot) THEN
         RETURN NULL;
     END IF;
     RETURN md5(concat_ws(',', (SELECT b.token FROM pgshadow.boot b),
@@ -411,17 +419,15 @@ $$;
 
 -- Everything a fill needs besides table state, taken on the proxy's own connection
 -- before the client's query is sent. Anything later only makes validation stricter.
--- NULLs during recovery. The boot token is created here if needed (before the snapshot).
-CREATE OR REPLACE FUNCTION pgshadow.fill_context(OUT snap text, OUT epoch text, OUT settings text)
-LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp AS $$
+-- NULLs during recovery. (The proxy adds settings_hash() at the top level of its query.)
+CREATE OR REPLACE FUNCTION pgshadow.fill_context(OUT snap text, OUT epoch text)
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF pg_is_in_recovery() THEN
         RETURN;
     END IF;
-    PERFORM pgshadow.boot_token();
     snap := pg_current_snapshot()::text;
     epoch := pgshadow.catalog_epoch();
-    settings := pgshadow.settings_hash();
 END $$;
 
 -- Table state for the proxy's own connection: how each reference resolves for a session
@@ -448,12 +454,13 @@ $$;
 -- settings hash (the same on every row).
 CREATE OR REPLACE FUNCTION pgshadow.validate(
     p_item int[], p_rel oid[], p_fp text[], p_snap text[], p_role text[],
-    p_nsp text[], p_name text[], p_path text[], p_epoch text[], p_settings text[], p_funcs text[])
+    p_nsp text[], p_name text[], p_path text[], p_epoch text[], p_settings text[], p_funcs text[],
+    p_cur_settings text)
 RETURNS TABLE (item int, valid boolean, meta_ok boolean, settings text)
 LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp SET plan_cache_mode = force_generic_plan AS $$
 DECLARE
     cur_epoch     text := pgshadow.catalog_epoch();
-    cur_settings  text := pgshadow.settings_hash();
+    cur_settings  text := p_cur_settings;
 BEGIN
     -- PL/pgSQL so the plan is cached per session (the proxy's check connections are long-lived).
     RETURN QUERY
@@ -537,8 +544,9 @@ END $$;
 -- every transaction below that xmin is visible to them. So entries below it can go.
 -- A long-running transaction holds xmin back, which just delays trimming (like vacuum);
 -- it never invalidates cached results.
+-- SECURITY DEFINER so a proxy role granted EXECUTE needs no write access of its own.
 CREATE OR REPLACE FUNCTION pgshadow.trim(p_keep interval) RETURNS bigint
-LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     n  bigint := 0;
     h  xid8;
@@ -571,8 +579,8 @@ BEGIN
     EXECUTE format('GRANT USAGE ON SCHEMA pgshadow TO %I', p_role);
     EXECUTE format('GRANT SELECT ON pgshadow.changelog, pgshadow.state TO %I', p_role);
     EXECUTE format('GRANT SELECT ON pgshadow.boot TO %I', p_role);
-    EXECUTE format('GRANT EXECUTE ON FUNCTION pgshadow.validate(int[], oid[], text[], text[], text[], text[], text[], text[], text[], text[], text[]),
-                    pgshadow.table_state(text, text, text[], text[]), pgshadow.fill_context(),
+    EXECUTE format('GRANT EXECUTE ON FUNCTION pgshadow.validate(int[], oid[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text),
+                    pgshadow.settings_hash(), pgshadow.table_state(text, text, text[], text[]), pgshadow.fill_context(),
                     pgshadow.shadowed(text[], text[], text[]), pgshadow.clock_columns(oid[], text[]),
                     pgshadow.catalog_epoch(), pgshadow.boot_token() TO %I', p_role);
 END $$;

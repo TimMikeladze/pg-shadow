@@ -119,7 +119,7 @@ struct TableStates {
 
 const TABLE_STATE_SQL: &str = "SELECT ord, rel, eligible, fp, qualified FROM pgshadow.table_state(\
      $1::pg_catalog.text, $2::pg_catalog.text, $3::pg_catalog.text[], $4::pg_catalog.text[])";
-const FILL_CONTEXT_SQL: &str = "SELECT snap, epoch, settings FROM pgshadow.fill_context()";
+const FILL_CONTEXT_SQL: &str = "SELECT f.snap, f.epoch, pgshadow.settings_hash() FROM pgshadow.fill_context() f";
 const SHADOWED_SQL: &str = "SELECT pgshadow.catalog_epoch(), \
      pgshadow.shadowed($1::pg_catalog.text[], $2::pg_catalog.text[], $3::pg_catalog.text[])";
 const CLOCK_COLUMNS_SQL: &str =
@@ -191,7 +191,8 @@ pub const SCHEMA_VERSION: i32 = 5;
 
 const VALIDATE_SQL: &str = "SELECT item, valid, meta_ok, settings FROM pgshadow.validate($1::pg_catalog.int4[], \
      $2::pg_catalog.oid[], $3::pg_catalog.text[], $4::pg_catalog.text[], $5::pg_catalog.text[], $6::pg_catalog.text[], \
-     $7::pg_catalog.text[], $8::pg_catalog.text[], $9::pg_catalog.text[], $10::pg_catalog.text[], $11::pg_catalog.text[])";
+     $7::pg_catalog.text[], $8::pg_catalog.text[], $9::pg_catalog.text[], $10::pg_catalog.text[], $11::pg_catalog.text[], \
+     pgshadow.settings_hash())";
 
 /// The server the check connections are on: database, and postmaster start time (so a
 /// session can confirm it is on the same server).
@@ -381,6 +382,10 @@ async fn worker(
                 continue;
             }
         };
+        // Make sure this server has a boot token before anything is cached.
+        if let Err(e) = client.query_one("SELECT pgshadow.boot_token()", &[]).await {
+            tracing::debug!(error = %e, "creating boot token failed");
+        }
         match client
             .query_opt(SERVER_SQL, &[])
             .await

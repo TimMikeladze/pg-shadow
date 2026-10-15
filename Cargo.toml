@@ -47,7 +47,13 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 4
+strip = true
+
+# For profiling: cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = false
 
 [[test]]
 name = "it"

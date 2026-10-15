@@ -8,7 +8,7 @@ $P -f "$(dirname "$0")/../sql/schema.sql" 2>/dev/null
 $P -c "DROP TABLE IF EXISTS t1; DROP SCHEMA IF EXISTS early CASCADE; CREATE TABLE t1 (id int PRIMARY KEY, v int); INSERT INTO t1 VALUES (1, 1); SELECT pgshadow.enable('t1');" >/dev/null
 OID=$($P -tAc "SELECT 't1'::regclass::oid")
 state() {
-  read SNAP EPOCH SETTINGS < <($P -tAF ' ' -c "SELECT snap, epoch, settings FROM pgshadow.fill_context()")
+  read SNAP EPOCH SETTINGS < <($P -tAF ' ' -c "SELECT pgshadow.boot_token() IS NULL; SELECT f.snap, f.epoch, pgshadow.settings_hash() FROM pgshadow.fill_context() f" | tail -1)
   FP=$($P -tAc "SELECT fp FROM pgshadow.rel_state('t1'::regclass)")
 }
 # valid [search_path] [role] [schema-qualifier] [functions]
@@ -16,7 +16,7 @@ valid() {
   local path=${1:-'"\$user", public'} role=${2:-postgres} nsp=${3:-NULL} funcs=${4:-}
   [ "$nsp" != NULL ] && nsp="'$nsp'"
   $P -tAc "SELECT valid FROM pgshadow.validate(ARRAY[1], ARRAY[$OID]::oid[], ARRAY[\$f\$$FP\$f\$], ARRAY['$SNAP'], ARRAY['$role'],
-           ARRAY[$nsp]::text[], ARRAY['t1'], ARRAY[\$p\$$path\$p\$], ARRAY['$EPOCH'], ARRAY['$SETTINGS'], ARRAY['$funcs'])"
+           ARRAY[$nsp]::text[], ARRAY['t1'], ARRAY[\$p\$$path\$p\$], ARRAY['$EPOCH'], ARRAY['$SETTINGS'], ARRAY['$funcs'], pgshadow.settings_hash())"
 }
 
 psql -h ${PGHOST:-/tmp} -p ${PGPORT:-5433} -U postgres -d shadow -q -c "BEGIN; UPDATE t1 SET v = 2; SELECT pg_sleep(1.5); COMMIT;" >/dev/null &
@@ -67,6 +67,9 @@ state; $P -c "ALTER TYPE mood RENAME VALUE 'ok' TO 'fine'"; expect f "$(valid)" 
 state; $P -c "ALTER SYSTEM SET extra_float_digits = 2" -c "SELECT pg_reload_conf()" >/dev/null; sleep 0.3
 expect f "$(valid)" "formatting setting changed by a config reload: invalid"
 $P -c "ALTER SYSTEM RESET extra_float_digits" -c "SELECT pg_reload_conf()" >/dev/null; sleep 0.3
+state; $P -c "ALTER SYSTEM SET search_path = 'other, public'" -c "SELECT pg_reload_conf()" >/dev/null; sleep 0.3
+expect f "$(valid)" "search_path changed by a config reload: invalid"
+$P -c "ALTER SYSTEM RESET search_path" -c "SELECT pg_reload_conf()" >/dev/null; sleep 0.3
 $P -c "DROP TABLE IF EXISTS audit_par CASCADE; CREATE TABLE audit_par (id int) PARTITION BY RANGE (id); CREATE TABLE audit_p1 PARTITION OF audit_par FOR VALUES FROM (0) TO (100)"
 R=$($P -tAc "SELECT pgshadow.enable('audit_p1')" 2>&1 | grep -c "partition or inheritance child"); expect 1 "$R" "partition cannot be enabled"
 $P -c "DROP TABLE IF EXISTS audit_parent, audit_child CASCADE; CREATE TABLE audit_parent (id int); CREATE TABLE audit_child () INHERITS (audit_parent)"
@@ -103,7 +106,7 @@ $P -c "DROP TYPE zz_ct CASCADE; DROP FUNCTION IF EXISTS zz_cf(zz_ct); DROP COLLA
 $P -c "DROP VIEW IF EXISTS vw1; CREATE VIEW vw1 AS SELECT 1 AS x" >/dev/null
 R=$($P -tAc "SELECT (pgshadow.rel_state('vw1'::regclass)).reason" 2>&1); expect "not a plain table (relkind v)" "$R" "view: refused without an error"
 $P -c "DROP VIEW vw1" >/dev/null
-state; ARGS="ARRAY[1], ARRAY[$OID]::oid[], ARRAY[\$f\$$FP\$f\$], ARRAY['$SNAP'], ARRAY['postgres'], ARRAY[NULL]::text[], ARRAY['t1'], ARRAY['public'], ARRAY['$EPOCH'], ARRAY['$SETTINGS'], ARRAY['lower']"
+state; ARGS="ARRAY[1], ARRAY[$OID]::oid[], ARRAY[\$f\$$FP\$f\$], ARRAY['$SNAP'], ARRAY['postgres'], ARRAY[NULL]::text[], ARRAY['t1'], ARRAY['public'], ARRAY['$EPOCH'], ARRAY['$SETTINGS'], ARRAY['lower'], pgshadow.settings_hash()"
 MS=$( (for i in $(seq 8); do echo "SELECT 1 FROM pgshadow.validate($ARGS);"; done; echo "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM pgshadow.validate($ARGS);") | $P -tA | tail -n +9 | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["Execution Time"])')
 echo "validate() server time for one item (warm session): ${MS} ms"
 exit $fail

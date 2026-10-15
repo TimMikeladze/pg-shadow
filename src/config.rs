@@ -161,7 +161,7 @@ impl Default for Cache {
             disk_capacity: 8 << 30,
             max_entry_size: 8 << 20,
             ttl: Duration::from_secs(600),
-            min_query_time: Duration::from_millis(1),
+            min_query_time: Duration::from_millis(3),
             verify_sample_rate: 0.0,
             classifier_capacity: 20_000,
             invalidation_cooldown: Duration::from_secs(60),

@@ -1,0 +1,47 @@
+# pgshadow configuration. Every key can also be set with an environment variable
+# PGSHADOW_<SECTION>_<KEY>, e.g. PGSHADOW_CHECK_DSN or PGSHADOW_CACHE_MEMORY.
+# Values shown are the defaults unless marked "example".
+
+[listen]
+addr = "0.0.0.0:6432"            # where your applications connect
+# tls_cert = "/etc/pgshadow/server.crt"   # optional: accept TLS from clients
+# tls_key  = "/etc/pgshadow/server.key"
+max_connections = 1000           # each client connection holds one Postgres connection
+
+[upstream]                       # the Postgres your clients would otherwise connect to
+host = "example.tsdb.cloud.timescale.com"   # example
+port = 5432                                  # example
+tls = "verify-full"              # disable | prefer | require | verify-full
+# ca_file = "/etc/ssl/certs/ca-certificates.crt"
+connect_timeout = "10s"
+
+[check]                          # the proxy's own connections (validation, maintenance)
+dsn = "host=example.tsdb.cloud.timescale.com port=5432 dbname=tsdb user=pgshadow password=secret"  # example
+connections = 2                  # parallel batched checks
+timeout = "250ms"                # slower check = serve from Postgres instead
+max_batch = 256
+
+[cache]
+enabled = true
+memory = "512MB"
+# disk_path = "/var/lib/pgshadow"   # optional second tier (foyer); survives restarts
+disk_capacity = "8GB"
+max_entry_size = "8MB"           # larger results stream through uncached
+ttl = "10m"                      # must be shorter than changelog.retention
+min_query_time = "3ms"           # cheaper queries are not worth a check round trip
+verify_sample_rate = 0.0         # e.g. 0.01 = re-run 1% of hits on Postgres and compare
+classifier_capacity = 20000
+table_state_ttl = "2s"
+invalidation_cooldown = "60s"
+
+[changelog]
+retention = "15m"
+trim_interval = "1m"             # 0 on all but one proxy if you run several (any one is fine)
+
+[admin]
+addr = "127.0.0.1:9187"          # GET /healthz /readyz, POST /cache/enable|disable|purge; "" = off
+
+[log]
+format = "json"                  # json | pretty
+level = "info"                   # "info,pgshadow::query=debug" logs every query's outcome
+summary_interval = "60s"

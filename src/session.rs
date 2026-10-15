@@ -771,8 +771,8 @@ impl Session {
         }
     }
 
-    /// Re-read the session's settings when they may have changed. Sent ahead of the
-    /// client's next request (not inside a failed transaction), and not waited for.
+    /// Re-read the session's settings when they may have changed (not inside a failed
+    /// transaction). Done when a request is about to use the cache, and at session start.
     async fn refresh_fingerprint_if_needed(&mut self) -> std::io::Result<()> {
         if !self.sh.enabled() || !self.sh.validator.installed() || self.open_forward {
             return Ok(());
@@ -792,7 +792,6 @@ impl Session {
     // ---- simple protocol ----
 
     async fn on_simple(&mut self, frame: Frame) -> std::io::Result<()> {
-        self.refresh_fingerprint_if_needed().await?;
         let Some(q) = frame.decode::<protocol::Query>() else {
             return self.forward(vec![frame], true, UnitEffects::unknown(), None, None, None, Bytes::new()).await;
         };
@@ -812,7 +811,6 @@ impl Session {
     // ---- extended protocol ----
 
     async fn on_batch(&mut self, frames: Vec<Frame>) -> std::io::Result<()> {
-        self.refresh_fingerprint_if_needed().await?;
         match self.cacheable_shape(&frames) {
             Some(req) => {
                 let cls = self.sh.classifier.get(req.sql());
@@ -1004,6 +1002,10 @@ impl Session {
         } else if let Some(r) = self.sh.policy_skip(cls.shape) {
             Err(r)
         } else {
+            // Only now, when the cache is about to be used, re-read the session's settings
+            // if anything since the last read could have changed them.
+            self.refresh_fingerprint_if_needed().await?;
+            self.wait_idle().await;
             self.session_blocker()
         };
         let fp = match blocker {
