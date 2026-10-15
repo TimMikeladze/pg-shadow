@@ -1,0 +1,18 @@
+# Local development against the sandbox Postgres.
+[listen]
+addr = "127.0.0.1:6432"
+[upstream]
+host = "127.0.0.1"
+port = 5433
+tls = "disable"
+[check]
+dsn = "host=127.0.0.1 port=5433 user=postgres dbname=shadow"
+[cache]
+memory = "64MB"
+min_query_time = "0ms"
+[admin]
+addr = "127.0.0.1:9187"
+[log]
+format = "pretty"
+level = "info,pgshadow::query=debug"
+summary_interval = "5s"

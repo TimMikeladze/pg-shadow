@@ -1,0 +1,53 @@
+[package]
+name = "pgshadow"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A never-stale caching proxy for Postgres: drop it in front of your database by changing the host and port."
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pgshadow"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crc32fast = "1"
+foyer = "0.22.6"
+parking_lot = "0.12"
+pg_query = "6.2.1"
+pgwire = { version = "0.41.1", default-features = false }
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+webpki-roots = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+debug = 1
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
