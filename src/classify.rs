@@ -102,12 +102,26 @@ pub struct Cacheable {
 
 impl Classified {
     fn not_cacheable(reason: &'static str, effects: Vec<Effect>, shape: u64) -> Self {
-        Self { cacheable: None, bypass_reason: reason, effects, shape }
+        Self {
+            cacheable: None,
+            bypass_reason: reason,
+            effects,
+            shape,
+        }
     }
 
     /// True if no statement could have written data.
     pub fn is_read_only(&self) -> bool {
-        self.effects.iter().all(|e| matches!(e, Effect::Read | Effect::Show | Effect::TxnControl | Effect::TxnEnd | Effect::Begin(_)))
+        self.effects.iter().all(|e| {
+            matches!(
+                e,
+                Effect::Read
+                    | Effect::Show
+                    | Effect::TxnControl
+                    | Effect::TxnEnd
+                    | Effect::Begin(_)
+            )
+        })
     }
 
     /// True if a statement might have changed session settings or state.
@@ -124,69 +138,301 @@ impl Classified {
 /// query uncacheable.
 const SAFE_FUNCTIONS: &[&str] = &[
     // aggregates
-    "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every", "array_agg",
-    "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
-    "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp",
-    "percentile_cont", "percentile_disc", "mode", "bit_and", "bit_or", "bit_xor",
-    "corr", "covar_pop", "covar_samp", "regr_slope", "regr_intercept", "regr_count",
-    "regr_r2", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy", "any_value",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "bool_and",
+    "bool_or",
+    "every",
+    "array_agg",
+    "string_agg",
+    "json_agg",
+    "jsonb_agg",
+    "json_object_agg",
+    "jsonb_object_agg",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "variance",
+    "var_pop",
+    "var_samp",
+    "percentile_cont",
+    "percentile_disc",
+    "mode",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "corr",
+    "covar_pop",
+    "covar_samp",
+    "regr_slope",
+    "regr_intercept",
+    "regr_count",
+    "regr_r2",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_sxx",
+    "regr_syy",
+    "regr_sxy",
+    "any_value",
     // window
-    "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead",
-    "first_value", "last_value", "nth_value",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "ntile",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
     // strings
-    "lower", "upper", "initcap", "length", "char_length", "character_length", "octet_length",
-    "bit_length", "substr", "substring", "left", "right", "lpad", "rpad", "btrim", "ltrim",
-    "rtrim", "trim", "concat", "concat_ws", "replace", "split_part", "strpos", "position",
-    "starts_with", "reverse", "repeat", "ascii", "chr", "md5", "sha224", "sha256", "sha384",
-    "sha512", "encode", "decode", "format", "quote_ident", "quote_literal", "quote_nullable",
-    "regexp_replace", "regexp_match", "regexp_matches", "regexp_like", "regexp_count",
-    "regexp_instr", "regexp_substr", "regexp_split_to_array", "regexp_split_to_table",
-    "translate", "overlay", "to_char", "to_hex", "to_ascii", "unistr", "normalize",
-    "string_to_array", "string_to_table", "array_to_string", "convert_from", "convert_to",
+    "lower",
+    "upper",
+    "initcap",
+    "length",
+    "char_length",
+    "character_length",
+    "octet_length",
+    "bit_length",
+    "substr",
+    "substring",
+    "left",
+    "right",
+    "lpad",
+    "rpad",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "trim",
+    "concat",
+    "concat_ws",
+    "replace",
+    "split_part",
+    "strpos",
+    "position",
+    "starts_with",
+    "reverse",
+    "repeat",
+    "ascii",
+    "chr",
+    "md5",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "encode",
+    "decode",
+    "format",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "regexp_replace",
+    "regexp_match",
+    "regexp_matches",
+    "regexp_like",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_substr",
+    "regexp_split_to_array",
+    "regexp_split_to_table",
+    "translate",
+    "overlay",
+    "to_char",
+    "to_hex",
+    "to_ascii",
+    "unistr",
+    "normalize",
+    "string_to_array",
+    "string_to_table",
+    "array_to_string",
+    "convert_from",
+    "convert_to",
     // numbers
-    "abs", "round", "ceil", "ceiling", "floor", "trunc", "mod", "power", "pow", "sqrt",
-    "cbrt", "exp", "ln", "log", "log10", "sign", "div", "degrees", "radians", "pi", "gcd",
-    "lcm", "width_bucket", "scale", "min_scale", "trim_scale", "factorial", "to_number",
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "abs",
+    "round",
+    "ceil",
+    "ceiling",
+    "floor",
+    "trunc",
+    "mod",
+    "power",
+    "pow",
+    "sqrt",
+    "cbrt",
+    "exp",
+    "ln",
+    "log",
+    "log10",
+    "sign",
+    "div",
+    "degrees",
+    "radians",
+    "pi",
+    "gcd",
+    "lcm",
+    "width_bucket",
+    "scale",
+    "min_scale",
+    "trim_scale",
+    "factorial",
+    "to_number",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
     // date/time functions that do not read the clock
-    "date_trunc", "date_part", "extract", "date_bin", "make_date", "make_time",
-    "make_timestamp", "make_timestamptz", "make_interval", "to_timestamp", "to_date",
-    "justify_days", "justify_hours", "justify_interval", "isfinite", "timezone",
+    "date_trunc",
+    "date_part",
+    "extract",
+    "date_bin",
+    "make_date",
+    "make_time",
+    "make_timestamp",
+    "make_timestamptz",
+    "make_interval",
+    "to_timestamp",
+    "to_date",
+    "justify_days",
+    "justify_hours",
+    "justify_interval",
+    "isfinite",
+    "timezone",
     // json
-    "to_json", "to_jsonb", "row_to_json", "array_to_json", "json_build_object",
-    "jsonb_build_object", "json_build_array", "jsonb_build_array", "json_object",
-    "jsonb_object", "json_array_length", "jsonb_array_length", "json_typeof",
-    "jsonb_typeof", "json_extract_path", "jsonb_extract_path", "json_extract_path_text",
-    "jsonb_extract_path_text", "json_each", "jsonb_each", "json_each_text",
-    "jsonb_each_text", "json_array_elements", "jsonb_array_elements",
-    "json_array_elements_text", "jsonb_array_elements_text", "json_object_keys",
-    "jsonb_object_keys", "jsonb_set", "jsonb_insert", "jsonb_strip_nulls", "json_strip_nulls",
-    "jsonb_pretty", "jsonb_path_query", "jsonb_path_query_array", "jsonb_path_query_first",
-    "jsonb_path_exists", "jsonb_path_match", "json_populate_record", "jsonb_populate_record",
-    "json_to_record", "jsonb_to_record", "json_to_recordset", "jsonb_to_recordset",
+    "to_json",
+    "to_jsonb",
+    "row_to_json",
+    "array_to_json",
+    "json_build_object",
+    "jsonb_build_object",
+    "json_build_array",
+    "jsonb_build_array",
+    "json_object",
+    "jsonb_object",
+    "json_array_length",
+    "jsonb_array_length",
+    "json_typeof",
+    "jsonb_typeof",
+    "json_extract_path",
+    "jsonb_extract_path",
+    "json_extract_path_text",
+    "jsonb_extract_path_text",
+    "json_each",
+    "jsonb_each",
+    "json_each_text",
+    "jsonb_each_text",
+    "json_array_elements",
+    "jsonb_array_elements",
+    "json_array_elements_text",
+    "jsonb_array_elements_text",
+    "json_object_keys",
+    "jsonb_object_keys",
+    "jsonb_set",
+    "jsonb_insert",
+    "jsonb_strip_nulls",
+    "json_strip_nulls",
+    "jsonb_pretty",
+    "jsonb_path_query",
+    "jsonb_path_query_array",
+    "jsonb_path_query_first",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "json_populate_record",
+    "jsonb_populate_record",
+    "json_to_record",
+    "jsonb_to_record",
+    "json_to_recordset",
+    "jsonb_to_recordset",
     // arrays and sets
-    "array_length", "array_lower", "array_upper", "array_ndims", "array_dims", "cardinality",
-    "unnest", "array_position", "array_positions", "array_remove", "array_replace",
-    "array_append", "array_prepend", "array_cat", "array_fill", "array_reverse",
-    "array_sort", "trim_array", "generate_series", "generate_subscripts",
+    "array_length",
+    "array_lower",
+    "array_upper",
+    "array_ndims",
+    "array_dims",
+    "cardinality",
+    "unnest",
+    "array_position",
+    "array_positions",
+    "array_remove",
+    "array_replace",
+    "array_append",
+    "array_prepend",
+    "array_cat",
+    "array_fill",
+    "array_reverse",
+    "array_sort",
+    "trim_array",
+    "generate_series",
+    "generate_subscripts",
     // misc
-    "coalesce", "nullif", "greatest", "least", "num_nulls", "num_nonnulls",
-    "host", "masklen", "network", "family",
-    "lower_inf", "upper_inf", "isempty", "range_merge",
+    "coalesce",
+    "nullif",
+    "greatest",
+    "least",
+    "num_nulls",
+    "num_nonnulls",
+    "host",
+    "masklen",
+    "network",
+    "family",
+    "lower_inf",
+    "upper_inf",
+    "isempty",
+    "range_merge",
 ];
 
 /// Functions with no side effects whose results are NOT stable (time, randomness,
 /// session info). A SELECT using them is read-only but never cached.
 const READ_ONLY_UNCACHEABLE: &[&str] = &[
-    "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "timeofday",
-    "random", "random_normal", "gen_random_uuid", "uuidv4", "uuidv7", "current_setting",
-    "version", "pg_backend_pid", "inet_client_addr", "inet_client_port", "inet_server_addr",
-    "inet_server_port", "pg_postmaster_start_time", "pg_conf_load_time", "current_database",
-    "current_schema", "current_schemas", "age", "pg_is_in_recovery", "txid_current_snapshot",
-    "pg_current_snapshot", "pg_typeof", "has_table_privilege", "has_schema_privilege",
-    "has_database_privilege", "pg_get_userbyid", "pg_table_is_visible", "obj_description",
-    "col_description", "format_type", "pg_get_expr", "pg_get_indexdef", "pg_get_constraintdef",
-    "pg_relation_size", "pg_total_relation_size", "pg_size_pretty", "to_regclass", "to_regtype",
+    "now",
+    "clock_timestamp",
+    "statement_timestamp",
+    "transaction_timestamp",
+    "timeofday",
+    "random",
+    "random_normal",
+    "gen_random_uuid",
+    "uuidv4",
+    "uuidv7",
+    "current_setting",
+    "version",
+    "pg_backend_pid",
+    "inet_client_addr",
+    "inet_client_port",
+    "inet_server_addr",
+    "inet_server_port",
+    "pg_postmaster_start_time",
+    "pg_conf_load_time",
+    "current_database",
+    "current_schema",
+    "current_schemas",
+    "age",
+    "pg_is_in_recovery",
+    "txid_current_snapshot",
+    "pg_current_snapshot",
+    "pg_typeof",
+    "has_table_privilege",
+    "has_schema_privilege",
+    "has_database_privilege",
+    "pg_get_userbyid",
+    "pg_table_is_visible",
+    "obj_description",
+    "col_description",
+    "format_type",
+    "pg_get_expr",
+    "pg_get_indexdef",
+    "pg_get_constraintdef",
+    "pg_relation_size",
+    "pg_total_relation_size",
+    "pg_size_pretty",
+    "to_regclass",
+    "to_regtype",
 ];
 
 /// Literal strings that Postgres turns into the current time when cast to a date/time type.
@@ -202,7 +448,6 @@ pub fn is_time_word(s: &str) -> bool {
 /// Date/time target types: casting text to these can read the clock.
 const DATETIME_TYPES: &[&str] = &["timestamp", "timestamptz", "date", "time", "timetz"];
 
-
 fn safe_functions() -> &'static HashSet<&'static str> {
     use std::sync::OnceLock;
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -212,7 +457,13 @@ fn safe_functions() -> &'static HashSet<&'static str> {
 fn read_only_functions() -> &'static HashSet<&'static str> {
     use std::sync::OnceLock;
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| SAFE_FUNCTIONS.iter().chain(READ_ONLY_UNCACHEABLE).copied().collect())
+    SET.get_or_init(|| {
+        SAFE_FUNCTIONS
+            .iter()
+            .chain(READ_ONLY_UNCACHEABLE)
+            .copied()
+            .collect()
+    })
 }
 
 /// Everything found anywhere in a statement's parse tree.
@@ -249,7 +500,9 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
     match v {
         Value::Object(map) => {
             // RangeVar, whether it appears as a tagged node or as a typed field.
-            if let (Some(Value::String(rel)), Some(_)) = (map.get("relname"), map.get("relpersistence")) {
+            if let (Some(Value::String(rel)), Some(_)) =
+                (map.get("relname"), map.get("relpersistence"))
+            {
                 let schema = map.get("schemaname").and_then(Value::as_str).unwrap_or("");
                 let catalog = map.get("catalogname").and_then(Value::as_str).unwrap_or("");
                 if !catalog.is_empty() {
@@ -269,7 +522,9 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
                             .and_then(Value::as_array)
                             .map(|a| {
                                 a.iter()
-                                    .filter_map(|n| n.pointer("/node/String/sval").and_then(Value::as_str))
+                                    .filter_map(|n| {
+                                        n.pointer("/node/String/sval").and_then(Value::as_str)
+                                    })
                                     .map(str::to_string)
                                     .collect()
                             })
@@ -301,7 +556,9 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
                     "AExpr" => {
                         if let Some(names) = val.get("name").and_then(Value::as_array) {
                             for n in names {
-                                if let Some(op) = n.pointer("/node/String/sval").and_then(Value::as_str) {
+                                if let Some(op) =
+                                    n.pointer("/node/String/sval").and_then(Value::as_str)
+                                {
                                     out.operators.push(op.to_string());
                                 }
                             }
@@ -313,7 +570,9 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
                             .and_then(Value::as_array)
                             .map(|a| {
                                 a.iter()
-                                    .filter_map(|n| n.pointer("/node/String/sval").and_then(Value::as_str))
+                                    .filter_map(|n| {
+                                        n.pointer("/node/String/sval").and_then(Value::as_str)
+                                    })
                                     .map(str::to_string)
                                     .collect()
                             })
@@ -365,8 +624,17 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
 /// Functions over date/time values whose result, cast to a date/time type, cannot depend
 /// on the clock (given date/time or constant arguments).
 const DATETIME_FUNCS: &[&str] = &[
-    "date_trunc", "date_bin", "timezone", "make_date", "make_time", "make_timestamp", "make_timestamptz",
-    "to_timestamp", "date_add", "date_subtract", "make_interval",
+    "date_trunc",
+    "date_bin",
+    "timezone",
+    "make_date",
+    "make_time",
+    "make_timestamp",
+    "make_timestamptz",
+    "to_timestamp",
+    "date_add",
+    "date_subtract",
+    "make_interval",
 ];
 
 /// Whether casting this expression to a date/time type is certain not to read the clock.
@@ -376,22 +644,35 @@ const DATETIME_FUNCS: &[&str] = &[
 /// time -- a text column, `j->>'ts'`, string functions, CASE, ... -- does not.
 fn datetime_safe(v: &serde_json::Value, cols: &mut Vec<String>) -> bool {
     use serde_json::Value;
-    let Some(map) = v.as_object() else { return false };
+    let Some(map) = v.as_object() else {
+        return false;
+    };
     if let Some(inner) = map.get("node") {
         return datetime_safe(inner, cols);
     }
-    let Some((kind, val)) = map.iter().next().filter(|_| map.len() == 1) else { return false };
+    let Some((kind, val)) = map.iter().next().filter(|_| map.len() == 1) else {
+        return false;
+    };
     let names = |key: &str| -> Vec<String> {
         val.get(key)
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|n| n.pointer("/node/String/sval").and_then(Value::as_str)).map(str::to_string).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.pointer("/node/String/sval").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     match kind.as_str() {
         "ParamRef" | "AConst" => true,
         "ColumnRef" => {
             let fields = val.get("fields").and_then(Value::as_array);
-            match fields.and_then(|f| f.last()).and_then(|n| n.pointer("/node/String/sval")).and_then(Value::as_str) {
+            match fields
+                .and_then(|f| f.last())
+                .and_then(|n| n.pointer("/node/String/sval"))
+                .and_then(Value::as_str)
+            {
                 Some(c) => {
                     cols.push(c.to_string());
                     true
@@ -409,7 +690,8 @@ fn datetime_safe(v: &serde_json::Value, cols: &mut Vec<String>) -> bool {
                 .and_then(Value::as_str)
                 .or(target.last().map(String::as_str))
                 .unwrap_or("");
-            DATETIME_TYPES.contains(&target) && val.get("arg").is_some_and(|a| datetime_safe(a, cols))
+            DATETIME_TYPES.contains(&target)
+                && val.get("arg").is_some_and(|a| datetime_safe(a, cols))
         }
         "FuncCall" => {
             let f = names("funcname");
@@ -419,12 +701,17 @@ fn datetime_safe(v: &serde_json::Value, cols: &mut Vec<String>) -> bool {
                 _ => false,
             };
             ok_name
-                && val.get("args").and_then(Value::as_array).is_none_or(|args| args.iter().all(|a| datetime_safe(a, cols)))
+                && val
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .is_none_or(|args| args.iter().all(|a| datetime_safe(a, cols)))
         }
         "AExpr" => {
             let op = names("name");
             matches!(op.as_slice(), [o] if o == "+" || o == "-")
-                && ["lexpr", "rexpr"].iter().all(|k| val.get(*k).is_none_or(|x| datetime_safe(x, cols)))
+                && ["lexpr", "rexpr"]
+                    .iter()
+                    .all(|k| val.get(*k).is_none_or(|x| datetime_safe(x, cols)))
         }
         _ => false,
     }
@@ -477,7 +764,11 @@ pub fn classify(sql: &str) -> Classified {
         return Classified::not_cacheable("could not analyze", effects, shape);
     };
     if effects[0] != Effect::Read {
-        return Classified::not_cacheable("SELECT calling functions that may have side effects", effects, shape);
+        return Classified::not_cacheable(
+            "SELECT calling functions that may have side effects",
+            effects,
+            shape,
+        );
     }
     let reason = if sc.into {
         Some("SELECT INTO")
@@ -527,7 +818,11 @@ pub fn classify(sql: &str) -> Classified {
     operators.extend(["=", "<>", "<", ">", "<=", ">="].map(String::from));
     operators.sort();
     operators.dedup();
-    let mut types: Vec<String> = sc.cast_types.iter().filter_map(|t| t.last().cloned()).collect();
+    let mut types: Vec<String> = sc
+        .cast_types
+        .iter()
+        .filter_map(|t| t.last().cloned())
+        .collect();
     types.extend(sc.collations.iter().cloned());
     types.sort();
     types.dedup();
@@ -536,7 +831,13 @@ pub fn classify(sql: &str) -> Classified {
     clock_columns.dedup();
 
     Classified {
-        cacheable: Some(Cacheable { relations: rels, functions, operators, types, clock_columns }),
+        cacheable: Some(Cacheable {
+            relations: rels,
+            functions,
+            operators,
+            types,
+            clock_columns,
+        }),
         bypass_reason: "",
         effects,
         shape,
@@ -544,8 +845,13 @@ pub fn classify(sql: &str) -> Classified {
 }
 
 fn effect_of(node: Option<&NodeEnum>, sc: &Scan) -> Effect {
-    let Some(node) = node else { return Effect::Other };
-    let funcs_read_only = sc.funcs.iter().all(|f| func_name_in(f, read_only_functions()));
+    let Some(node) = node else {
+        return Effect::Other;
+    };
+    let funcs_read_only = sc
+        .funcs
+        .iter()
+        .all(|f| func_name_in(f, read_only_functions()));
     match node {
         NodeEnum::SelectStmt(_) => {
             if funcs_read_only && !sc.dml && !sc.locking && !sc.into {
@@ -555,18 +861,22 @@ fn effect_of(node: Option<&NodeEnum>, sc: &Scan) -> Effect {
             }
         }
         NodeEnum::VariableShowStmt(_) => Effect::Show,
-        NodeEnum::TransactionStmt(t) => match TransactionStmtKind::try_from(t.kind) {
-            Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
-                Effect::Begin(isolation_option(&t.options))
+        NodeEnum::TransactionStmt(t) => {
+            match TransactionStmtKind::try_from(t.kind) {
+                Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+                    Effect::Begin(isolation_option(&t.options))
+                }
+                Ok(
+                    TransactionStmtKind::TransStmtCommit | TransactionStmtKind::TransStmtRollback,
+                ) if !t.chain => Effect::TxnEnd,
+                Ok(
+                    TransactionStmtKind::TransStmtSavepoint
+                    | TransactionStmtKind::TransStmtRelease
+                    | TransactionStmtKind::TransStmtRollbackTo,
+                ) => Effect::TxnControl,
+                _ => Effect::Other,
             }
-            Ok(TransactionStmtKind::TransStmtCommit | TransactionStmtKind::TransStmtRollback) if !t.chain => Effect::TxnEnd,
-            Ok(
-                TransactionStmtKind::TransStmtSavepoint
-                | TransactionStmtKind::TransStmtRelease
-                | TransactionStmtKind::TransStmtRollbackTo,
-            ) => Effect::TxnControl,
-            _ => Effect::Other,
-        },
+        }
         NodeEnum::InsertStmt(_)
         | NodeEnum::UpdateStmt(_)
         | NodeEnum::DeleteStmt(_)
@@ -585,7 +895,11 @@ fn effect_of(node: Option<&NodeEnum>, sc: &Scan) -> Effect {
             }
         }
         NodeEnum::DiscardStmt(d) => match DiscardMode::try_from(d.target) {
-            Ok(DiscardMode::DiscardPlans | DiscardMode::DiscardSequences | DiscardMode::DiscardTemp) => Effect::Other,
+            Ok(
+                DiscardMode::DiscardPlans
+                | DiscardMode::DiscardSequences
+                | DiscardMode::DiscardTemp,
+            ) => Effect::Other,
             _ => Effect::DiscardAll,
         },
         _ => Effect::Other,
@@ -641,7 +955,11 @@ fn shape_level_ok(sql: &str) -> bool {
 
 impl Classifier {
     pub fn new(capacity: usize) -> Self {
-        Self { exact: Mutex::new(Default::default()), shapes: Mutex::new(Default::default()), capacity }
+        Self {
+            exact: Mutex::new(Default::default()),
+            shapes: Mutex::new(Default::default()),
+            capacity,
+        }
     }
 
     pub fn get(&self, sql: &str) -> Arc<Classified> {
@@ -678,8 +996,11 @@ impl Classifier {
 
 /// A single SELECT (cacheable or not, as long as it was classified as one).
 fn is_select(c: &Classified) -> bool {
-    c.cacheable.is_some() || c.bypass_reason != "not a SELECT" && c.bypass_reason != "multiple statements"
-        && c.bypass_reason != "parse error" && c.bypass_reason != "empty query"
+    c.cacheable.is_some()
+        || c.bypass_reason != "not a SELECT"
+            && c.bypass_reason != "multiple statements"
+            && c.bypass_reason != "parse error"
+            && c.bypass_reason != "empty query"
 }
 
 #[cfg(test)]
@@ -705,10 +1026,18 @@ mod tests {
     #[test]
     fn plain_selects_are_cacheable() {
         assert!(cacheable("SELECT * FROM orders WHERE id = $1"));
-        assert!(cacheable("select status, count(*), sum(total) from public.orders group by 1 order by 1"));
-        assert!(cacheable("SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id"));
-        assert!(cacheable("SELECT date_trunc('day', created_at), count(*) FROM orders GROUP BY 1"));
-        assert!(cacheable("SELECT row_number() OVER (ORDER BY id), lower(name) FROM t"));
+        assert!(cacheable(
+            "select status, count(*), sum(total) from public.orders group by 1 order by 1"
+        ));
+        assert!(cacheable(
+            "SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id"
+        ));
+        assert!(cacheable(
+            "SELECT date_trunc('day', created_at), count(*) FROM orders GROUP BY 1"
+        ));
+        assert!(cacheable(
+            "SELECT row_number() OVER (ORDER BY id), lower(name) FROM t"
+        ));
         assert!(cacheable("SELECT current_user, id FROM t"));
     }
 
@@ -771,24 +1100,39 @@ mod tests {
 
     #[test]
     fn date_casts_of_columns_and_constants_stay_cacheable() {
-        assert!(cacheable("SELECT created_at::date, count(*) FROM t GROUP BY 1"));
-        assert!(cacheable("SELECT * FROM t WHERE created_at > '2026-01-01'::timestamptz"));
-        assert!(cacheable("SELECT date_trunc('day', created_at)::date FROM t"));
-        assert!(cacheable("SELECT * FROM t WHERE created_at > $1::timestamptz"));
+        assert!(cacheable(
+            "SELECT created_at::date, count(*) FROM t GROUP BY 1"
+        ));
+        assert!(cacheable(
+            "SELECT * FROM t WHERE created_at > '2026-01-01'::timestamptz"
+        ));
+        assert!(cacheable(
+            "SELECT date_trunc('day', created_at)::date FROM t"
+        ));
+        assert!(cacheable(
+            "SELECT * FROM t WHERE created_at > $1::timestamptz"
+        ));
     }
 
     #[test]
     fn date_cast_columns_are_reported() {
-        let c = classify("SELECT created_at::date, CAST(d AS timestamptz) + interval '1 day' FROM t").cacheable.unwrap();
+        let c =
+            classify("SELECT created_at::date, CAST(d AS timestamptz) + interval '1 day' FROM t")
+                .cacheable
+                .unwrap();
         assert_eq!(c.clock_columns, vec!["created_at", "d"]);
-        let c = classify("SELECT date_trunc('day', t.ts)::date FROM t ORDER BY v COLLATE \"C\"").cacheable.unwrap();
+        let c = classify("SELECT date_trunc('day', t.ts)::date FROM t ORDER BY v COLLATE \"C\"")
+            .cacheable
+            .unwrap();
         assert_eq!(c.clock_columns, vec!["ts"]);
         assert!(c.types.contains(&"C".to_string()));
     }
 
     #[test]
     fn names_for_the_shadowing_check() {
-        let c = classify("SELECT lower(a), a::int4 FROM t WHERE b ~~ 'x%' AND c @> $1").cacheable.unwrap();
+        let c = classify("SELECT lower(a), a::int4 FROM t WHERE b ~~ 'x%' AND c @> $1")
+            .cacheable
+            .unwrap();
         assert_eq!(c.functions, vec!["lower"]);
         assert!(c.operators.contains(&"~~".to_string()) && c.operators.contains(&"@>".to_string()));
         assert!(c.operators.contains(&"=".to_string()));
@@ -797,7 +1141,9 @@ mod tests {
 
     #[test]
     fn writes_and_multi_statements_are_not_cacheable() {
-        assert!(!cacheable("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"));
+        assert!(!cacheable(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        ));
         assert!(!cacheable("SELECT * FROM t; SELECT * FROM u"));
         assert!(!cacheable("UPDATE t SET a = 1"));
         assert!(!cacheable("not sql at all"));
@@ -808,16 +1154,25 @@ mod tests {
     fn relations_include_cte_shadowed_tables() {
         assert_eq!(
             rels("WITH f AS (SELECT * FROM f) SELECT * FROM f JOIN s.g ON true"),
-            vec![(None, "f".into(), true), (Some("s".into()), "g".into(), false)]
+            vec![
+                (None, "f".into(), true),
+                (Some("s".into()), "g".into(), false)
+            ]
         );
-        assert_eq!(rels("SELECT * FROM \"Mixed\" , lower_t"), vec![
-            (None, "Mixed".into(), false),
-            (None, "lower_t".into(), false)
-        ]);
-        assert_eq!(rels("SELECT (SELECT max(x) FROM inner_t) FROM outer_t"), vec![
-            (None, "inner_t".into(), false),
-            (None, "outer_t".into(), false)
-        ]);
+        assert_eq!(
+            rels("SELECT * FROM \"Mixed\" , lower_t"),
+            vec![
+                (None, "Mixed".into(), false),
+                (None, "lower_t".into(), false)
+            ]
+        );
+        assert_eq!(
+            rels("SELECT (SELECT max(x) FROM inner_t) FROM outer_t"),
+            vec![
+                (None, "inner_t".into(), false),
+                (None, "outer_t".into(), false)
+            ]
+        );
     }
 
     #[test]
@@ -834,16 +1189,34 @@ mod tests {
         assert!(n.cacheable.is_none());
         // Escapes that decode to a time word must not reuse the shape either.
         c.get("SELECT * FROM orders WHERE d < '2024-01-01'::timestamptz");
-        assert!(c.get("SELECT * FROM orders WHERE d < E'\\x6eow'::timestamptz").cacheable.is_none());
+        assert!(c
+            .get("SELECT * FROM orders WHERE d < E'\\x6eow'::timestamptz")
+            .cacheable
+            .is_none());
         // Different functions are different shapes.
         c.get("SELECT lower(name) FROM orders WHERE id = 1");
-        assert!(c.get("SELECT random() FROM orders WHERE id = 1").cacheable.is_none());
-        assert!(c.get("SELECT * FROM orders WHERE id = 1 FOR UPDATE").cacheable.is_none());
-        for sql in ["UPDATE orders SET a = 1 WHERE id = 2", "UPDATE orders SET a = 1 WHERE id = 3"] {
+        assert!(c
+            .get("SELECT random() FROM orders WHERE id = 1")
+            .cacheable
+            .is_none());
+        assert!(c
+            .get("SELECT * FROM orders WHERE id = 1 FOR UPDATE")
+            .cacheable
+            .is_none());
+        for sql in [
+            "UPDATE orders SET a = 1 WHERE id = 2",
+            "UPDATE orders SET a = 1 WHERE id = 3",
+        ] {
             assert_eq!(c.get(sql).effects, vec![Effect::Write]);
         }
-        assert_eq!(c.get("BEGIN ISOLATION LEVEL SERIALIZABLE").effects, vec![Effect::Begin(Some(Isolation::Serializable))]);
-        assert_eq!(c.get("BEGIN ISOLATION LEVEL READ COMMITTED").effects, vec![Effect::Begin(Some(Isolation::ReadCommitted))]);
+        assert_eq!(
+            c.get("BEGIN ISOLATION LEVEL SERIALIZABLE").effects,
+            vec![Effect::Begin(Some(Isolation::Serializable))]
+        );
+        assert_eq!(
+            c.get("BEGIN ISOLATION LEVEL READ COMMITTED").effects,
+            vec![Effect::Begin(Some(Isolation::ReadCommitted))]
+        );
     }
 
     #[test]
@@ -862,15 +1235,27 @@ mod tests {
         assert_eq!(classify("COMMIT AND CHAIN").effects, vec![Effect::Other]);
         assert_eq!(classify("SAVEPOINT a").effects, vec![Effect::TxnControl]);
         assert_eq!(classify("UPDATE t SET a = 1").effects, vec![Effect::Write]);
-        assert_eq!(classify("UPDATE t SET a = set_config('x','y',false)").effects, vec![Effect::Other]);
+        assert_eq!(
+            classify("UPDATE t SET a = set_config('x','y',false)").effects,
+            vec![Effect::Other]
+        );
         assert_eq!(classify("SET search_path = x").effects, vec![Effect::Other]);
         assert_eq!(classify("SHOW search_path").effects, vec![Effect::Show]);
         assert_eq!(classify("DISCARD TEMP").effects, vec![Effect::Other]);
-        assert_eq!(classify("SELECT set_config('a','b',false)").effects, vec![Effect::Other]);
+        assert_eq!(
+            classify("SELECT set_config('a','b',false)").effects,
+            vec![Effect::Other]
+        );
         assert_eq!(classify("SELECT now()").effects, vec![Effect::Read]);
         assert_eq!(classify("SELECT nextval('s')").effects, vec![Effect::Other]);
-        assert_eq!(classify("DEALLOCATE foo").effects, vec![Effect::Deallocate(Some("foo".into()))]);
-        assert_eq!(classify("DEALLOCATE ALL").effects, vec![Effect::Deallocate(None)]);
+        assert_eq!(
+            classify("DEALLOCATE foo").effects,
+            vec![Effect::Deallocate(Some("foo".into()))]
+        );
+        assert_eq!(
+            classify("DEALLOCATE ALL").effects,
+            vec![Effect::Deallocate(None)]
+        );
         assert_eq!(classify("DISCARD ALL").effects, vec![Effect::DiscardAll]);
         assert_eq!(classify("DO $$ BEGIN END $$").effects, vec![Effect::Other]);
         assert!(classify("BEGIN; SELECT 1").is_read_only());

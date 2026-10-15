@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
+      # Postgres 16 in Docker on :5433 with the test roles and TLS
+      - run: bench/dev-postgres.sh
+      - run: cargo build --all-targets
+      - run: cargo test --lib
+      - run: cargo test --test it -- --test-threads 8
+      - run: PGHOST=127.0.0.1 bench/sql-check.sh
+      - run: pip install pytest "psycopg[binary]" sqlalchemy
+      - run: python -m pytest -q py_tests

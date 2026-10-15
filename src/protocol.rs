@@ -35,7 +35,11 @@ impl Frame {
         raw.put_i32(body.len() as i32 + 4);
         raw.extend_from_slice(&body);
         let raw = raw.freeze();
-        Self { tag, body: raw.slice(5..), raw }
+        Self {
+            tag,
+            body: raw.slice(5..),
+            raw,
+        }
     }
 
     pub fn wire_len(&self) -> usize {
@@ -72,7 +76,10 @@ pub struct FrameReader<R> {
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn new(inner: R) -> Self {
-        Self { inner, buf: BytesMut::with_capacity(16 * 1024) }
+        Self {
+            inner,
+            buf: BytesMut::with_capacity(16 * 1024),
+        }
     }
 
     async fn fill(&mut self, need: usize) -> io::Result<bool> {
@@ -85,7 +92,10 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if self.buf.is_empty() {
                     return Ok(false);
                 }
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-message"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-message",
+                ));
             }
         }
         Ok(true)
@@ -99,12 +109,19 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         let tag = self.buf[0];
         let len = i32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
         if len < 4 || len as usize > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad message length {len}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad message length {len}"),
+            ));
         }
         let total = 1 + len as usize;
         self.fill(total).await?;
         let raw = self.buf.split_to(total).freeze();
-        Ok(Some(Frame { tag, body: raw.slice(5..), raw }))
+        Ok(Some(Frame {
+            tag,
+            body: raw.slice(5..),
+            raw,
+        }))
     }
 
     /// Whether a complete message is already buffered (reading it will not wait).
@@ -123,7 +140,10 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
         let len = i32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
         if !(8..=10_000).contains(&len) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad startup packet length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad startup packet length",
+            ));
         }
         self.fill(len as usize).await?;
         Ok(Some(self.buf.split_to(len as usize).freeze()))
@@ -162,7 +182,10 @@ pub fn startup_params(pkt: &[u8]) -> Vec<(String, String)> {
         if k.is_empty() {
             break;
         }
-        out.push((String::from_utf8_lossy(k).into_owned(), String::from_utf8_lossy(v).into_owned()));
+        out.push((
+            String::from_utf8_lossy(k).into_owned(),
+            String::from_utf8_lossy(v).into_owned(),
+        ));
     }
     out
 }
@@ -176,7 +199,12 @@ pub fn ready_for_query(status: u8) -> Frame {
 /// ErrorResponse / NoticeResponse body from fields.
 pub fn error_frame(severity: &str, code: &str, message: &str) -> Frame {
     let mut b = BytesMut::new();
-    for (k, v) in [(b'S', severity), (b'V', severity), (b'C', code), (b'M', message)] {
+    for (k, v) in [
+        (b'S', severity),
+        (b'V', severity),
+        (b'C', code),
+        (b'M', message),
+    ] {
         b.put_u8(k);
         b.extend_from_slice(v.as_bytes());
         b.put_u8(0);
@@ -268,7 +296,11 @@ pub fn error_fields(body: &[u8]) -> (String, String) {
     while i < body.len() && body[i] != 0 {
         let k = body[i];
         i += 1;
-        let end = body[i..].iter().position(|b| *b == 0).map(|p| i + p).unwrap_or(body.len());
+        let end = body[i..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|p| i + p)
+            .unwrap_or(body.len());
         let v = String::from_utf8_lossy(&body[i..end]).into_owned();
         match k {
             b'C' => code = v,
@@ -320,7 +352,11 @@ mod tests {
 
     #[tokio::test]
     async fn frames_roundtrip() {
-        let frames = vec![parse_msg("s1", "SELECT $1"), bind_msg("", "s1", &[Some("x"), None]), sync_msg()];
+        let frames = vec![
+            parse_msg("s1", "SELECT $1"),
+            bind_msg("", "s1", &[Some("x"), None]),
+            sync_msg(),
+        ];
         let mut buf = Vec::new();
         write_frames(&mut buf, &frames).await.unwrap();
         let mut r = FrameReader::new(&buf[..]);
@@ -337,7 +373,10 @@ mod tests {
 
     #[test]
     fn arrays_and_rows() {
-        assert_eq!(text_array(&[Some("a\"b"), None, Some("c\\")]), r#"{"a\"b",NULL,"c\\"}"#);
+        assert_eq!(
+            text_array(&[Some("a\"b"), None, Some("c\\")]),
+            r#"{"a\"b",NULL,"c\\"}"#
+        );
         let mut b = BytesMut::new();
         b.put_i16(2);
         b.put_i32(3);
@@ -345,6 +384,9 @@ mod tests {
         b.put_i32(-1);
         assert_eq!(data_row_values(&b), vec![Some("abc".to_string()), None]);
         let e = error_frame("ERROR", "42P01", "nope");
-        assert_eq!(error_fields(&e.body), ("42P01".to_string(), "nope".to_string()));
+        assert_eq!(
+            error_fields(&e.body),
+            ("42P01".to_string(), "nope".to_string())
+        );
     }
 }

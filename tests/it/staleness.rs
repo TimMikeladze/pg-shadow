@@ -26,7 +26,10 @@ struct Log {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_stale_reads_under_concurrent_writes() {
-    let secs: u64 = std::env::var("PGSHADOW_STALENESS_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let secs: u64 = std::env::var("PGSHADOW_STALENESS_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     // Keep caching on even though this table is written constantly.
     let p = Arc::new(proxy_with(|c| c.cache.invalidation_cooldown = Duration::ZERO).await);
     let d = direct().await;
@@ -47,7 +50,11 @@ async fn no_stale_reads_under_concurrent_writes() {
         let log = log.clone();
         let p = p.clone();
         tasks.push(tokio::spawn(async move {
-            let c = if w == 3 { p.client().await } else { direct().await };
+            let c = if w == 3 {
+                p.client().await
+            } else {
+                direct().await
+            };
             let mut n = 0u64;
             while Instant::now() < stop {
                 let (a, b) = {
@@ -58,7 +65,10 @@ async fn no_stale_reads_under_concurrent_writes() {
                     // single autocommit update
                     0 | 3 => {
                         let v: i64 = c
-                            .query_one("UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v", &[&a])
+                            .query_one(
+                                "UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v",
+                                &[&a],
+                            )
                             .await
                             .unwrap()
                             .get(0);
@@ -67,8 +77,22 @@ async fn no_stale_reads_under_concurrent_writes() {
                     // two rows in one transaction
                     1 => {
                         c.batch_execute("BEGIN").await.unwrap();
-                        let va: i64 = c.query_one("UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v", &[&a]).await.unwrap().get(0);
-                        let vb: i64 = c.query_one("UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v", &[&b]).await.unwrap().get(0);
+                        let va: i64 = c
+                            .query_one(
+                                "UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v",
+                                &[&a],
+                            )
+                            .await
+                            .unwrap()
+                            .get(0);
+                        let vb: i64 = c
+                            .query_one(
+                                "UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v",
+                                &[&b],
+                            )
+                            .await
+                            .unwrap()
+                            .get(0);
                         c.batch_execute("COMMIT").await.unwrap();
                         let now = Instant::now();
                         let mut l = log.lock();
@@ -80,7 +104,14 @@ async fn no_stale_reads_under_concurrent_writes() {
                     // a transaction held open for a while: the in-progress-at-snapshot case
                     _ => {
                         c.batch_execute("BEGIN").await.unwrap();
-                        let v: i64 = c.query_one("UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v", &[&a]).await.unwrap().get(0);
+                        let v: i64 = c
+                            .query_one(
+                                "UPDATE s_counters SET v = v + 1 WHERE id = $1 RETURNING v",
+                                &[&a],
+                            )
+                            .await
+                            .unwrap()
+                            .get(0);
                         tokio::time::sleep(Duration::from_millis(30)).await;
                         c.batch_execute("COMMIT").await.unwrap();
                         log.lock().writes.push((Instant::now(), a, v));
@@ -109,9 +140,18 @@ async fn no_stale_reads_under_concurrent_writes() {
                 }
                 let started = Instant::now();
                 let values: Vec<i64> = if r % 2 == 0 {
-                    c.query(q, &[]).await.unwrap().iter().map(|row| row.get::<_, i64>(1)).collect()
+                    c.query(q, &[])
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<_, i64>(1))
+                        .collect()
                 } else {
-                    simple_rows(&c, q).await.iter().map(|row| row[1].as_ref().unwrap().parse().unwrap()).collect()
+                    simple_rows(&c, q)
+                        .await
+                        .iter()
+                        .map(|row| row[1].as_ref().unwrap().parse().unwrap())
+                        .collect()
                 };
                 if in_txn {
                     c.batch_execute("COMMIT").await.unwrap();
@@ -151,9 +191,25 @@ async fn no_stale_reads_under_concurrent_writes() {
         log.reads.len(),
         hits,
         p.fills(),
-        p.app.shared.stats.invalidated.load(std::sync::atomic::Ordering::Relaxed),
+        p.app
+            .shared
+            .stats
+            .invalidated
+            .load(std::sync::atomic::Ordering::Relaxed),
         violations.len()
     );
-    assert!(violations.is_empty(), "stale reads:\n{}", violations.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
-    assert!(hits > 50, "the cache should have served reads between writes (hits = {hits})");
+    assert!(
+        violations.is_empty(),
+        "stale reads:\n{}",
+        violations
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        hits > 50,
+        "the cache should have served reads between writes (hits = {hits})"
+    );
 }

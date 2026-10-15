@@ -24,7 +24,9 @@ async fn client(cfg: &Config) -> Result<tokio_postgres::Client> {
 
 pub async fn install(cfg: &Config) -> Result<()> {
     let c = client(cfg).await?;
-    c.batch_execute(SCHEMA_SQL).await.context("installing pgshadow schema")?;
+    c.batch_execute(SCHEMA_SQL)
+        .await
+        .context("installing pgshadow schema")?;
     Ok(())
 }
 
@@ -46,9 +48,12 @@ pub async fn uninstall(cfg: &Config) -> Result<()> {
 pub async fn enable(cfg: &Config, tables: &[String]) -> Result<()> {
     let c = client(cfg).await?;
     for t in tables {
-        c.execute("SELECT pgshadow.enable($1::pg_catalog.text::pg_catalog.regclass)", &[t])
-            .await
-            .with_context(|| format!("enabling {t}"))?;
+        c.execute(
+            "SELECT pgshadow.enable($1::pg_catalog.text::pg_catalog.regclass)",
+            &[t],
+        )
+        .await
+        .with_context(|| format!("enabling {t}"))?;
         println!("{t}: cached");
     }
     Ok(())
@@ -57,9 +62,12 @@ pub async fn enable(cfg: &Config, tables: &[String]) -> Result<()> {
 pub async fn disable(cfg: &Config, tables: &[String]) -> Result<()> {
     let c = client(cfg).await?;
     for t in tables {
-        c.execute("SELECT pgshadow.disable($1::pg_catalog.text::pg_catalog.regclass)", &[t])
-            .await
-            .with_context(|| format!("disabling {t}"))?;
+        c.execute(
+            "SELECT pgshadow.disable($1::pg_catalog.text::pg_catalog.regclass)",
+            &[t],
+        )
+        .await
+        .with_context(|| format!("disabling {t}"))?;
         println!("{t}: no longer cached");
     }
     Ok(())
@@ -68,7 +76,10 @@ pub async fn disable(cfg: &Config, tables: &[String]) -> Result<()> {
 pub async fn status(cfg: &Config) -> Result<()> {
     let c = client(cfg).await?;
     let rows = c
-        .query("SELECT table_name::text, cached, coalesce(reason, '') FROM pgshadow.tables ORDER BY 1", &[])
+        .query(
+            "SELECT table_name::text, cached, coalesce(reason, '') FROM pgshadow.tables ORDER BY 1",
+            &[],
+        )
         .await
         .context("reading pgshadow.tables (is pgshadow installed?)")?;
     if rows.is_empty() {
@@ -76,9 +87,19 @@ pub async fn status(cfg: &Config) -> Result<()> {
     }
     for r in rows {
         let (t, ok, reason): (String, bool, String) = (r.get(0), r.get(1), r.get(2));
-        println!("{t:<40} {}", if ok { "cached".to_string() } else { format!("NOT cached: {reason}") });
+        println!(
+            "{t:<40} {}",
+            if ok {
+                "cached".to_string()
+            } else {
+                format!("NOT cached: {reason}")
+            }
+        );
     }
-    let n: i64 = c.query_one("SELECT count(*) FROM pgshadow.changelog", &[]).await?.get(0);
+    let n: i64 = c
+        .query_one("SELECT count(*) FROM pgshadow.changelog", &[])
+        .await?
+        .get(0);
     println!("changelog rows: {n}");
     Ok(())
 }
@@ -106,13 +127,22 @@ async fn trim_loop(cfg: &Config) -> Result<()> {
     loop {
         tick.tick().await;
         let leader: bool = c
-            .query_one("SELECT pg_try_advisory_lock(hashtext('pgshadow.trim'))", &[])
+            .query_one(
+                "SELECT pg_try_advisory_lock(hashtext('pgshadow.trim'))",
+                &[],
+            )
             .await?
             .get(0);
         if !leader {
             continue;
         }
-        let n: i64 = c.query_one("SELECT pgshadow.trim($1::pg_catalog.text::pg_catalog.interval)", &[&keep]).await?.get(0);
+        let n: i64 = c
+            .query_one(
+                "SELECT pgshadow.trim($1::pg_catalog.text::pg_catalog.interval)",
+                &[&keep],
+            )
+            .await?
+            .get(0);
         if n > 0 {
             tracing::debug!(removed = n, "changelog trimmed");
         }
@@ -130,7 +160,9 @@ pub async fn serve_http(shared: Arc<Shared>, addr: String) -> Result<()> {
         .route("/cache/disable", post(disable_cache))
         .route("/cache/purge", post(purge))
         .with_state(shared);
-    let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding admin {addr}"))?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding admin {addr}"))?;
     tracing::info!(%addr, "admin endpoint listening");
     axum::serve(listener, app).await.context("admin endpoint")
 }
@@ -148,7 +180,11 @@ async fn ready(State(sh): State<Arc<Shared>>) -> (StatusCode, String) {
     );
     // Not being able to cache never stops the proxy from serving (it forwards), so
     // readiness only fails if checks are down while caching is supposed to be on.
-    let code = if !sh.enabled() || sh.validator.ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if !sh.enabled() || sh.validator.ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (code, body)
 }
 

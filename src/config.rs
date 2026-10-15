@@ -47,7 +47,12 @@ pub struct Listen {
 
 impl Default for Listen {
     fn default() -> Self {
-        Self { addr: "0.0.0.0:6432".into(), tls_cert: None, tls_key: None, max_connections: 1000 }
+        Self {
+            addr: "0.0.0.0:6432".into(),
+            tls_cert: None,
+            tls_key: None,
+            max_connections: 1000,
+        }
     }
 }
 
@@ -184,7 +189,10 @@ pub struct Changelog {
 
 impl Default for Changelog {
     fn default() -> Self {
-        Self { retention: Duration::from_secs(900), trim_interval: Duration::from_secs(60) }
+        Self {
+            retention: Duration::from_secs(900),
+            trim_interval: Duration::from_secs(60),
+        }
     }
 }
 
@@ -198,7 +206,9 @@ pub struct Admin {
 
 impl Default for Admin {
     fn default() -> Self {
-        Self { addr: "127.0.0.1:9187".into() }
+        Self {
+            addr: "127.0.0.1:9187".into(),
+        }
     }
 }
 
@@ -216,19 +226,27 @@ pub struct Log {
 
 impl Default for Log {
     fn default() -> Self {
-        Self { format: "json".into(), level: "info".into(), summary_interval: Duration::from_secs(60) }
+        Self {
+            format: "json".into(),
+            level: "info".into(),
+            summary_interval: Duration::from_secs(60),
+        }
     }
 }
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let mut value: toml::Table = match path {
-            Some(p) => toml::from_str(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
-                .with_context(|| format!("parsing {}", p.display()))?,
+            Some(p) => toml::from_str(
+                &std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
+            )
+            .with_context(|| format!("parsing {}", p.display()))?,
             None => toml::Table::new(),
         };
         apply_env(&mut value);
-        let cfg: Config = toml::Value::Table(value).try_into().context("invalid configuration")?;
+        let cfg: Config = toml::Value::Table(value)
+            .try_into()
+            .context("invalid configuration")?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -257,17 +275,33 @@ impl Config {
 /// (numbers, booleans), otherwise taken as strings.
 fn apply_env(root: &mut toml::Table) {
     for (k, v) in std::env::vars() {
-        let Some(rest) = k.strip_prefix("PGSHADOW_") else { continue };
-        let Some((section, key)) = rest.split_once('_') else { continue };
+        let Some(rest) = k.strip_prefix("PGSHADOW_") else {
+            continue;
+        };
+        let Some((section, key)) = rest.split_once('_') else {
+            continue;
+        };
         let (section, key) = (section.to_ascii_lowercase(), key.to_ascii_lowercase());
-        if !["listen", "upstream", "check", "cache", "changelog", "admin", "log"].contains(&section.as_str()) {
+        if ![
+            "listen",
+            "upstream",
+            "check",
+            "cache",
+            "changelog",
+            "admin",
+            "log",
+        ]
+        .contains(&section.as_str())
+        {
             continue;
         }
         let parsed = toml::from_str::<toml::Table>(&format!("v = {v}"))
             .ok()
             .and_then(|mut t| t.remove("v"))
             .unwrap_or(toml::Value::String(v));
-        let entry = root.entry(section).or_insert_with(|| toml::Value::Table(Default::default()));
+        let entry = root
+            .entry(section)
+            .or_insert_with(|| toml::Value::Table(Default::default()));
         if let toml::Value::Table(t) = entry {
             t.insert(key, parsed);
         }
@@ -276,7 +310,9 @@ fn apply_env(root: &mut toml::Table) {
 
 pub fn parse_size(s: &str) -> Result<usize> {
     let t = s.trim();
-    let split = t.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(t.len());
+    let split = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
     let (num, unit) = t.split_at(split);
     let n: f64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
     let mult = match unit.trim().to_ascii_uppercase().as_str() {
@@ -292,7 +328,9 @@ pub fn parse_size(s: &str) -> Result<usize> {
 
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let t = s.trim();
-    let split = t.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(t.len());
+    let split = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
     let (num, unit) = t.split_at(split);
     let n: f64 = num.parse().with_context(|| format!("bad duration {s:?}"))?;
     let secs = match unit.trim() {
@@ -366,7 +404,13 @@ mod tests {
         assert_eq!(cfg.cache.min_query_time, Duration::from_millis(2));
         cfg.validate().unwrap();
         let bad: Config = toml::from_str("[cache]\nttl = \"1h\"").unwrap();
-        assert!(bad.validate().is_err(), "ttl must be below changelog retention");
-        assert!(toml::from_str::<Config>("[cache]\nnope = 1").is_err(), "unknown keys are rejected");
+        assert!(
+            bad.validate().is_err(),
+            "ttl must be below changelog retention"
+        );
+        assert!(
+            toml::from_str::<Config>("[cache]\nnope = 1").is_err(),
+            "unknown keys are rejected"
+        );
     }
 }

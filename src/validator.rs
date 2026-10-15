@@ -82,13 +82,23 @@ struct Aux {
 
 impl Aux {
     fn new(cfg: &Config, tls: &Arc<rustls::ClientConfig>, sql: &'static str) -> Self {
-        Self { cfg: cfg.clone(), tls: tls.clone(), sql, conn: Mutex::new(None) }
+        Self {
+            cfg: cfg.clone(),
+            tls: tls.clone(),
+            sql,
+            conn: Mutex::new(None),
+        }
     }
 
-    async fn query(&self, params: &[&(dyn tokio_postgres::types::ToSql + Sync)]) -> Option<Vec<tokio_postgres::Row>> {
+    async fn query(
+        &self,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Option<Vec<tokio_postgres::Row>> {
         let mut guard = self.conn.lock().await;
         if guard.as_ref().is_none_or(|(c, _)| c.is_closed()) {
-            let c = net::connect_check(&self.cfg.check.dsn, self.cfg.upstream.tls, &self.tls).await.ok()?;
+            let c = net::connect_check(&self.cfg.check.dsn, self.cfg.upstream.tls, &self.tls)
+                .await
+                .ok()?;
             let st = c.prepare(self.sql).await.ok()?;
             *guard = Some((c, st));
         }
@@ -119,23 +129,38 @@ struct TableStates {
 
 const TABLE_STATE_SQL: &str = "SELECT ord, rel, eligible, fp, qualified FROM pgshadow.table_state(\
      $1::pg_catalog.text, $2::pg_catalog.text, $3::pg_catalog.text[], $4::pg_catalog.text[])";
-const FILL_CONTEXT_SQL: &str = "SELECT f.snap, f.epoch, pgshadow.settings_hash() FROM pgshadow.fill_context() f";
+const FILL_CONTEXT_SQL: &str =
+    "SELECT f.snap, f.epoch, pgshadow.settings_hash() FROM pgshadow.fill_context() f";
 const SHADOWED_SQL: &str = "SELECT pgshadow.catalog_epoch(), \
      pgshadow.shadowed($1::pg_catalog.text[], $2::pg_catalog.text[], $3::pg_catalog.text[])";
 const CLOCK_COLUMNS_SQL: &str =
     "SELECT pgshadow.clock_columns($1::pg_catalog.oid[], $2::pg_catalog.text[])";
 
 impl TableStates {
-    async fn lookup(&self, path: &str, role: &str, rels: &[(Option<String>, String)]) -> Option<Vec<Option<TableState>>> {
+    async fn lookup(
+        &self,
+        path: &str,
+        role: &str,
+        rels: &[(Option<String>, String)],
+    ) -> Option<Vec<Option<TableState>>> {
         let now = Instant::now();
-        let key = |nsp: &Option<String>, name: &String| (path.to_string(), role.to_string(), nsp.clone(), name.clone());
+        let key = |nsp: &Option<String>, name: &String| {
+            (
+                path.to_string(),
+                role.to_string(),
+                nsp.clone(),
+                name.clone(),
+            )
+        };
         let mut out: Vec<Option<Option<TableState>>> = Vec::with_capacity(rels.len());
         let mut missing = Vec::new();
         {
             let c = self.cache.lock();
             for (i, (nsp, name)) in rels.iter().enumerate() {
                 match c.get(&key(nsp, name)) {
-                    Some((at, st)) if now.duration_since(*at) < self.ttl => out.push(Some(st.clone())),
+                    Some((at, st)) if now.duration_since(*at) < self.ttl => {
+                        out.push(Some(st.clone()))
+                    }
                     _ => {
                         out.push(None);
                         missing.push(i);
@@ -233,7 +258,9 @@ impl Validator {
             let installed = installed.clone();
             let server = server.clone();
             let generation = generation.clone();
-            tokio::spawn(async move { worker(id, cfg, tls, rx, connected, installed, server, generation).await });
+            tokio::spawn(async move {
+                worker(id, cfg, tls, rx, connected, installed, server, generation).await
+            });
         }
         let meta = TableStates {
             ttl: cfg.cache.table_state_ttl,
@@ -241,7 +268,11 @@ impl Validator {
             cache: parking_lot::Mutex::new(Default::default()),
         };
         let (ctx_tx, ctx_rx) = mpsc::channel(4096);
-        tokio::spawn(context_worker(Aux::new(cfg, &tls, FILL_CONTEXT_SQL), ctx_rx, generation.clone()));
+        tokio::spawn(context_worker(
+            Aux::new(cfg, &tls, FILL_CONTEXT_SQL),
+            ctx_rx,
+            generation.clone(),
+        ));
         Arc::new(Self {
             tx,
             connected,
@@ -260,7 +291,10 @@ impl Validator {
     /// Whether a session in this database, on the server that started at this time, can
     /// use the cache.
     pub fn same_server(&self, db: &str, started: &str) -> bool {
-        self.server.lock().as_ref().is_some_and(|(d, s)| d == db && s == started)
+        self.server
+            .lock()
+            .as_ref()
+            .is_some_and(|(d, s)| d == db && s == started)
     }
 
     /// Increases whenever the server's configured settings are seen to change (a reload).
@@ -286,8 +320,18 @@ impl Validator {
 
     /// Whether any of these names could refer to a user-defined object instead of the
     /// built-in one, as of `epoch`. None if unknown (lookup failed or the epoch moved).
-    pub async fn any_shadowed(&self, epoch: &str, funcs: &[String], ops: &[String], types: &[String]) -> Option<bool> {
-        let tagged = |k: char, v: &[String]| v.iter().map(move |n| format!("{k}:{n}")).collect::<Vec<_>>();
+    pub async fn any_shadowed(
+        &self,
+        epoch: &str,
+        funcs: &[String],
+        ops: &[String],
+        types: &[String],
+    ) -> Option<bool> {
+        let tagged = |k: char, v: &[String]| {
+            v.iter()
+                .map(move |n| format!("{k}:{n}"))
+                .collect::<Vec<_>>()
+        };
         let all: Vec<String> = [tagged('f', funcs), tagged('o', ops), tagged('t', types)].concat();
         {
             let c = self.shadow.lock();
@@ -310,7 +354,10 @@ impl Validator {
         let hit: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         let mut c = self.shadow.lock();
         if c.epoch != epoch {
-            *c = ShadowCache { epoch: epoch.to_string(), ..Default::default() };
+            *c = ShadowCache {
+                epoch: epoch.to_string(),
+                ..Default::default()
+            };
         }
         let mut any = false;
         for n in &all {
@@ -331,7 +378,12 @@ impl Validator {
 
     /// How each reference resolves for a session with this search_path and role, and the
     /// table's state. None if the lookup failed.
-    pub async fn table_states(&self, path: &str, role: &str, rels: &[(Option<String>, String)]) -> Option<Vec<Option<TableState>>> {
+    pub async fn table_states(
+        &self,
+        path: &str,
+        role: &str,
+        rels: &[(Option<String>, String)],
+    ) -> Option<Vec<Option<TableState>>> {
         self.meta.lookup(path, role, rels).await
     }
 
@@ -386,11 +438,16 @@ async fn worker(
         if let Err(e) = client.query_one("SELECT pgshadow.boot_token()", &[]).await {
             tracing::debug!(error = %e, "creating boot token failed");
         }
-        match client
-            .query_opt(SERVER_SQL, &[])
-            .await
-            .map(|r| r.map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1), r.get::<_, String>(2), r.get::<_, Option<String>>(3))))
-        {
+        match client.query_opt(SERVER_SQL, &[]).await.map(|r| {
+            r.map(|r| {
+                (
+                    r.get::<_, i32>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, Option<String>>(3),
+                )
+            })
+        }) {
             Ok(Some((v, db, started, settings))) if v == SCHEMA_VERSION => {
                 // Recorded before caching is turned on, so no session settings can have
                 // been read before the first observation.
@@ -453,9 +510,18 @@ async fn worker(
                     if let Some(s) = settings {
                         generation.observe(&s);
                     }
-                    tracing::trace!(worker = id, items = batch.len(), micros = started.elapsed().as_micros() as u64, "check round");
+                    tracing::trace!(
+                        worker = id,
+                        items = batch.len(),
+                        micros = started.elapsed().as_micros() as u64,
+                        "check round"
+                    );
                     for (r, (valid, meta_ok)) in batch.into_iter().zip(results) {
-                        let v = if valid { Verdict::Valid } else { Verdict::Invalid { meta: !meta_ok } };
+                        let v = if valid {
+                            Verdict::Valid
+                        } else {
+                            Verdict::Invalid { meta: !meta_ok }
+                        };
                         let _ = r.reply.send(v);
                     }
                 }
@@ -494,7 +560,11 @@ async fn context_worker(
         // All NULL during recovery: nothing is cached on a standby.
         let ctx = aux.query(&[]).await.and_then(|rows| {
             let r = rows.first()?;
-            Some(FillContext { snapshot: r.get::<_, Option<String>>(0)?, epoch: r.get(1), settings: r.get::<_, Option<String>>(2)? })
+            Some(FillContext {
+                snapshot: r.get::<_, Option<String>>(0)?,
+                epoch: r.get(1),
+                settings: r.get::<_, Option<String>>(2)?,
+            })
         });
         if let Some(c) = &ctx {
             generation.observe(&c.settings);
@@ -538,7 +608,12 @@ async fn run_batch(
         }
     }
     let rows = client
-        .query(stmt, &[&item, &rel, &fp, &snap, &role, &nsp, &name, &path, &epoch, &settings, &funcs])
+        .query(
+            stmt,
+            &[
+                &item, &rel, &fp, &snap, &role, &nsp, &name, &path, &epoch, &settings, &funcs,
+            ],
+        )
         .await?;
     let mut out = vec![(false, false); batch.len()];
     let mut current = None;

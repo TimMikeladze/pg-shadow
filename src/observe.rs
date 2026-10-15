@@ -21,7 +21,11 @@ pub fn init_logging(cfg: &Log) {
     let _ = if cfg.format == "pretty" {
         builder.try_init()
     } else {
-        builder.json().flatten_event(true).with_current_span(false).try_init()
+        builder
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .try_init()
     };
 }
 
@@ -85,7 +89,11 @@ fn snap(s: &Stats) -> Snapshot {
 }
 
 /// Logs one summary line per interval with counts since the previous line.
-pub fn spawn_summary(stats: Arc<Stats>, interval: Duration, memory_usage: impl Fn() -> usize + Send + 'static) {
+pub fn spawn_summary(
+    stats: Arc<Stats>,
+    interval: Duration,
+    memory_usage: impl Fn() -> usize + Send + 'static,
+) {
     if interval.is_zero() {
         return;
     }
@@ -99,7 +107,11 @@ pub fn spawn_summary(stats: Arc<Stats>, interval: Duration, memory_usage: impl F
             let d = |f: fn(&Snapshot) -> u64| f(&now).saturating_sub(f(&prev));
             let mut bypass: Vec<_> = stats.take_bypass().into_iter().collect();
             bypass.sort_by(|a, b| b.1.cmp(&a.1));
-            let top: Vec<String> = bypass.iter().take(5).map(|(r, n)| format!("{r}={n}")).collect();
+            let top: Vec<String> = bypass
+                .iter()
+                .take(5)
+                .map(|(r, n)| format!("{r}={n}"))
+                .collect();
             tracing::info!(
                 target: "pgshadow::summary",
                 connections = stats.connections.load(Ordering::Relaxed),

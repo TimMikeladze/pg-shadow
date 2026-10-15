@@ -117,7 +117,10 @@ impl<R: Read> Reader<'_, R> {
 
 impl Code for Entry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        let mut w = Writer { w: writer, crc: crc32fast::Hasher::new() };
+        let mut w = Writer {
+            w: writer,
+            crc: crc32fast::Hasher::new(),
+        };
         (|| -> std::io::Result<()> {
             w.raw(&MAGIC.to_le_bytes())?;
             w.raw(&[VERSION])?;
@@ -152,7 +155,10 @@ impl Code for Entry {
     }
 
     fn decode(reader: &mut impl Read) -> foyer::Result<Self> {
-        let mut r = Reader { r: reader, crc: crc32fast::Hasher::new() };
+        let mut r = Reader {
+            r: reader,
+            crc: crc32fast::Hasher::new(),
+        };
         let entry = (|| -> std::io::Result<Entry> {
             let magic = u32::from_le_bytes(r.raw(4)?.try_into().unwrap());
             let version = r.raw(1)?[0];
@@ -184,14 +190,33 @@ impl Code for Entry {
                 };
                 let name = r.string()?;
                 let lock_name = r.string()?;
-                tables.push(TableDep { oid, fp, nsp, name, lock_name });
+                tables.push(TableDep {
+                    oid,
+                    fp,
+                    nsp,
+                    name,
+                    lock_name,
+                });
             }
-            Ok(Entry { request, response, snapshot, epoch, settings, tables, role, path, funcs, created_unix_ms, exec_micros })
+            Ok(Entry {
+                request,
+                response,
+                snapshot,
+                epoch,
+                settings,
+                tables,
+                role,
+                path,
+                funcs,
+                created_unix_ms,
+                exec_micros,
+            })
         })()
         .map_err(foyer::Error::io_error)?;
         let expected = r.crc.clone().finalize();
         let mut stored = [0u8; 4];
-        r.r.read_exact(&mut stored).map_err(foyer::Error::io_error)?;
+        r.r.read_exact(&mut stored)
+            .map_err(foyer::Error::io_error)?;
         if u32::from_le_bytes(stored) != expected {
             return Err(io_err("checksum mismatch"));
         }
@@ -210,13 +235,21 @@ impl Code for Entry {
             + self
                 .tables
                 .iter()
-                .map(|t| 64 + t.fp.len() + t.nsp.as_ref().map_or(0, String::len) + t.name.len() + t.lock_name.len())
+                .map(|t| {
+                    64 + t.fp.len()
+                        + t.nsp.as_ref().map_or(0, String::len)
+                        + t.name.len()
+                        + t.lock_name.len()
+                })
                 .sum::<usize>()
     }
 }
 
 pub fn now_unix_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Cache key: a 128-bit hash of the canonical request.
@@ -256,7 +289,11 @@ impl Store {
             None => builder,
         };
         let cache = builder.build().await.context("building cache")?;
-        Ok(Arc::new(Self { cache, ttl_ms: cfg.ttl.as_millis() as u64, disk: cfg.disk_path.is_some() }))
+        Ok(Arc::new(Self {
+            cache,
+            ttl_ms: cfg.ttl.as_millis() as u64,
+            disk: cfg.disk_path.is_some(),
+        }))
     }
 
     /// The entry for this request, if one is stored, matches exactly, and is within TTL.
@@ -318,8 +355,20 @@ mod tests {
             epoch: "3:900|0:0|1:880|0:0".into(),
             settings: "d41d8cd98f00b204e9800998ecf8427e".into(),
             tables: vec![
-                TableDep { oid: 16384, fp: "abc|r|f".into(), nsp: None, name: "orders".into(), lock_name: "public.orders".into() },
-                TableDep { oid: 16390, fp: "def".into(), nsp: Some("app".into()), name: "Items".into(), lock_name: "app.\"Items\"".into() },
+                TableDep {
+                    oid: 16384,
+                    fp: "abc|r|f".into(),
+                    nsp: None,
+                    name: "orders".into(),
+                    lock_name: "public.orders".into(),
+                },
+                TableDep {
+                    oid: 16390,
+                    fp: "def".into(),
+                    nsp: Some("app".into()),
+                    name: "Items".into(),
+                    lock_name: "app.\"Items\"".into(),
+                },
             ],
             role: "app".into(),
             path: "\"$user\", public".into(),
@@ -339,7 +388,10 @@ mod tests {
         for i in [5, 20, buf.len() / 2, buf.len() - 6] {
             let mut bad = buf.clone();
             bad[i] ^= 0x40;
-            assert!(Entry::decode(&mut &bad[..]).is_err(), "corruption at byte {i} not detected");
+            assert!(
+                Entry::decode(&mut &bad[..]).is_err(),
+                "corruption at byte {i} not detected"
+            );
         }
     }
 
@@ -356,7 +408,10 @@ mod tests {
         let k = key_of(&e.request);
         store.insert(k, e.clone());
         assert_eq!(store.get(k, &e.request).await.unwrap().value(), &e);
-        assert!(store.get(k, b"different request").await.is_none(), "request bytes are compared");
+        assert!(
+            store.get(k, b"different request").await.is_none(),
+            "request bytes are compared"
+        );
         store.close().await.unwrap();
         drop(store);
         // Reopen: the entry comes back from disk.

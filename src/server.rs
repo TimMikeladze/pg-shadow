@@ -63,7 +63,9 @@ impl Server {
         let mut tls_done = false;
         // Startup phase: SSL/GSS negotiation, cancel requests, then the StartupMessage.
         let startup = loop {
-            let Some(pkt) = rd.read_startup().await? else { return Ok(()) };
+            let Some(pkt) = rd.read_startup().await? else {
+                return Ok(());
+            };
             match protocol::startup_code(&pkt) {
                 protocol::SSL_REQUEST if !tls_done => {
                     let (mut s, buf) = rd.into_parts();
@@ -101,10 +103,21 @@ impl Server {
             }
         };
         let params = protocol::startup_params(&startup);
-        let param = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+        let param = |k: &str| {
+            params
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
         if param("replication") != "" && param("replication") != "false" {
             let (mut s, _) = rd.into_parts();
-            let _ = send_error(&mut s, "0A000", "pgshadow: replication connections are not supported").await;
+            let _ = send_error(
+                &mut s,
+                "0A000",
+                "pgshadow: replication connections are not supported",
+            )
+            .await;
             return Ok(());
         }
         let (user, database, app) = (param("user"), param("database"), param("application_name"));
@@ -115,7 +128,12 @@ impl Server {
             Err(e) => {
                 tracing::warn!(conn, error = %format!("{e:#}"), "cannot reach Postgres");
                 let (mut s, _) = rd.into_parts();
-                let _ = send_error(&mut s, "08006", &format!("pgshadow: cannot reach Postgres: {e:#}")).await;
+                let _ = send_error(
+                    &mut s,
+                    "08006",
+                    &format!("pgshadow: cannot reach Postgres: {e:#}"),
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -131,16 +149,24 @@ impl Server {
 
         // Relay authentication until the first ReadyForQuery.
         let status = loop {
-            let Some(f) = up_rd.read_frame().await? else { return Ok(()) };
+            let Some(f) = up_rd.read_frame().await? else {
+                return Ok(());
+            };
             match f.tag {
                 b'R' => {
                     let code = auth_code(&f);
-                    let f = if code == 10 { strip_channel_binding(&f) } else { f };
+                    let f = if code == 10 {
+                        strip_channel_binding(&f)
+                    } else {
+                        f
+                    };
                     cl_w.write_all(&f.to_bytes()).await?;
                     cl_w.flush().await?;
                     // These ask the client for a password message.
                     if matches!(code, 2 | 3 | 5 | 7 | 8 | 9 | 10 | 11) {
-                        let Some(reply) = cl_rd.read_frame().await? else { return Ok(()) };
+                        let Some(reply) = cl_rd.read_frame().await? else {
+                            return Ok(());
+                        };
                         up_w.write_all(&reply.to_bytes()).await?;
                         up_w.flush().await?;
                     }
@@ -225,7 +251,9 @@ async fn refuse(tcp: TcpStream, code: &str, msg: &str) -> std::io::Result<()> {
     // Read the startup packet first so the client sees the error.
     let mut rd = FrameReader::new(Box::new(tcp) as Stream);
     loop {
-        let Some(pkt) = rd.read_startup().await? else { return Ok(()) };
+        let Some(pkt) = rd.read_startup().await? else {
+            return Ok(());
+        };
         let (mut s, buf) = rd.into_parts();
         if protocol::startup_code(&pkt) == protocol::SSL_REQUEST {
             s.write_all(b"N").await?;

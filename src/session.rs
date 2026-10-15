@@ -91,7 +91,11 @@ impl Shared {
         }
         let t = m.entry(sql_hash).or_default();
         let us = elapsed.as_micros() as f64;
-        t.ewma_micros = if t.samples == 0 { us } else { t.ewma_micros * 0.8 + us * 0.2 };
+        t.ewma_micros = if t.samples == 0 {
+            us
+        } else {
+            t.ewma_micros * 0.8 + us * 0.2
+        };
         t.samples = t.samples.saturating_add(1);
     }
 
@@ -140,7 +144,8 @@ impl Shared {
             return false;
         }
         let now = Instant::now();
-        oids.into_iter().any(|o| m.get(&o).is_some_and(|until| *until > now))
+        oids.into_iter()
+            .any(|o| m.get(&o).is_some_and(|until| *until > now))
     }
 
     fn disable_rels(&self, oids: impl IntoIterator<Item = u32>, for_: Duration) {
@@ -185,7 +190,11 @@ impl Shared {
         }
         let (tx, rx) = watch::channel(false);
         m.insert(key, rx);
-        Inflight::Lead(InflightGuard { sh: self.clone(), key, tx })
+        Inflight::Lead(InflightGuard {
+            sh: self.clone(),
+            key,
+            tx,
+        })
     }
 }
 
@@ -285,7 +294,14 @@ impl UnitEffects {
 
     /// For units whose contents the proxy cannot fully see.
     fn unknown() -> Self {
-        UnitEffects { writes: true, begin: None, txn_end: true, settings: true, dirty: true, parsed: vec![] }
+        UnitEffects {
+            writes: true,
+            begin: None,
+            txn_end: true,
+            settings: true,
+            dirty: true,
+            parsed: vec![],
+        }
     }
 
     fn merge(&mut self, o: UnitEffects) {
@@ -313,7 +329,9 @@ impl Capture {
         }
         // Only plain result messages may be cached. Notices, errors, parameter changes,
         // notifications, COPY, partial results: never.
-        if !matches!(f.tag, b'1' | b'2' | b't' | b'T' | b'n' | b'D' | b'C') || self.buf.len() + f.wire_len() > self.limit {
+        if !matches!(f.tag, b'1' | b'2' | b't' | b'T' | b'n' | b'D' | b'C')
+            || self.buf.len() + f.wire_len() > self.limit
+        {
             self.clean = false;
             self.buf = BytesMut::new();
             return;
@@ -396,7 +414,13 @@ impl Req {
                 b.push(b'Q');
                 b.extend_from_slice(sql.as_bytes());
             }
-            Req::Extended { parse_idx, stmt, bind, describe, .. } => {
+            Req::Extended {
+                parse_idx,
+                stmt,
+                bind,
+                describe,
+                ..
+            } => {
                 b.push(b'E');
                 b.push(parse_idx.is_some() as u8);
                 b.push(describe.unwrap_or(0));
@@ -428,7 +452,9 @@ impl Req {
     fn frames(&self, skip_parse: bool) -> Vec<Frame> {
         match self {
             Req::Simple { frame, .. } => vec![frame.clone()],
-            Req::Extended { frames, parse_idx, .. } => frames
+            Req::Extended {
+                frames, parse_idx, ..
+            } => frames
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !(skip_parse && Some(*i) == *parse_idx))
@@ -439,7 +465,11 @@ impl Req {
 
     fn parse_frame(&self) -> Option<Frame> {
         match self {
-            Req::Extended { frames, parse_idx: Some(i), .. } => Some(frames[*i].clone()),
+            Req::Extended {
+                frames,
+                parse_idx: Some(i),
+                ..
+            } => Some(frames[*i].clone()),
             _ => None,
         }
     }
@@ -450,7 +480,12 @@ impl Req {
 
     fn parsed_with(&self, deps: Option<Arc<Vec<(u32, String)>>>) -> Vec<(String, StmtInfo)> {
         match self {
-            Req::Extended { parse_idx: Some(_), stmt, bind, .. } => {
+            Req::Extended {
+                parse_idx: Some(_),
+                stmt,
+                bind,
+                ..
+            } => {
                 let mut info = stmt.clone();
                 info.deps = deps;
                 vec![(bind.statement_name.clone().unwrap_or_default(), info)]
@@ -462,7 +497,11 @@ impl Req {
     /// For a Bind of a statement prepared earlier: its tables' state when prepared.
     fn prepared_deps(&self) -> Option<Option<&Arc<Vec<(u32, String)>>>> {
         match self {
-            Req::Extended { parse_idx: None, stmt, .. } => Some(stmt.deps.as_ref()),
+            Req::Extended {
+                parse_idx: None,
+                stmt,
+                ..
+            } => Some(stmt.deps.as_ref()),
             _ => None,
         }
     }
@@ -471,8 +510,13 @@ impl Req {
     /// ...). Checked in every format and at any length: the binary form of a text value is
     /// the same bytes, and a false positive only means a cache bypass.
     fn has_time_param(&self) -> bool {
-        let Req::Extended { bind, .. } = self else { return false };
-        bind.parameters.iter().any(|p| p.as_ref().is_some_and(|v| crate::classify::is_time_word(&String::from_utf8_lossy(v))))
+        let Req::Extended { bind, .. } = self else {
+            return false;
+        };
+        bind.parameters.iter().any(|p| {
+            p.as_ref()
+                .is_some_and(|v| crate::classify::is_time_word(&String::from_utf8_lossy(v)))
+        })
     }
 }
 
@@ -512,7 +556,8 @@ const FP_SQL: &str = "SELECT current_user::pg_catalog.text, session_user::pg_cat
 
 /// Inside a transaction: its isolation level, and whether it has written anything (by
 /// any route: a trigger, a function, a view calling one).
-const TXN_SQL: &str = "SELECT (pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL)::pg_catalog.text, \
+const TXN_SQL: &str =
+    "SELECT (pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL)::pg_catalog.text, \
      pg_catalog.current_setting('transaction_isolation')";
 
 /// Extended-protocol messages running one of the proxy's own queries on the client's
@@ -532,7 +577,13 @@ fn rows_of(frames: &[Frame]) -> Option<Vec<Vec<Option<String>>>> {
     if frames.iter().any(|f| f.tag == b'E') {
         return None;
     }
-    Some(frames.iter().filter(|f| f.tag == b'D').map(|f| protocol::data_row_values(&f.body)).collect())
+    Some(
+        frames
+            .iter()
+            .filter(|f| f.tag == b'D')
+            .map(|f| protocol::data_row_values(&f.body))
+            .collect(),
+    )
 }
 
 fn parse_fp(frames: &[Frame]) -> Option<SessionFp> {
@@ -618,7 +669,16 @@ pub async fn run(
             let _ = closed_tx.send(true);
         }
     });
-    let mut s = Session { sh, st, idle, up_w, up_units: up_tx, client_w: client_w.clone(), open_forward: false, conn };
+    let mut s = Session {
+        sh,
+        st,
+        idle,
+        up_w,
+        up_units: up_tx,
+        client_w: client_w.clone(),
+        open_forward: false,
+        conn,
+    };
     let mut rd = client_rd;
     let result = async {
         // Read the session's settings right away, so the first query can use the cache.
@@ -647,7 +707,11 @@ pub async fn run(
 
 impl Session {
     /// Handle one client message. Returns false when the session should end.
-    async fn on_frame(&mut self, frame: Frame, rd: &mut FrameReader<ReadHalf<Stream>>) -> std::io::Result<bool> {
+    async fn on_frame(
+        &mut self,
+        frame: Frame,
+        rd: &mut FrameReader<ReadHalf<Stream>>,
+    ) -> std::io::Result<bool> {
         match frame.tag {
             b'Q' => self.on_simple(frame).await?,
             b'P' | b'B' | b'D' | b'E' | b'C' if self.open_forward => {
@@ -659,7 +723,9 @@ impl Session {
                 let mut batch = vec![frame];
                 let mut bytes = batch[0].wire_len();
                 loop {
-                    let Some(next) = rd.read_frame().await? else { return Ok(false) };
+                    let Some(next) = rd.read_frame().await? else {
+                        return Ok(false);
+                    };
                     bytes += next.wire_len();
                     match next.tag {
                         b'S' => {
@@ -667,7 +733,11 @@ impl Session {
                             self.on_batch(batch).await?;
                             break;
                         }
-                        b'P' | b'B' | b'D' | b'E' | b'C' if batch.len() < 256 && bytes < (4 << 20) => batch.push(next),
+                        b'P' | b'B' | b'D' | b'E' | b'C'
+                            if batch.len() < 256 && bytes < (4 << 20) =>
+                        {
+                            batch.push(next)
+                        }
                         _ => {
                             // Flush, very long pipelines, or anything unusual: forward as-is.
                             batch.push(next);
@@ -684,14 +754,32 @@ impl Session {
                     self.write_up(&[frame]).await?;
                     self.open_forward = false;
                 } else {
-                    self.forward(vec![frame], ends, UnitEffects::default(), None, None, None, Bytes::new()).await?;
+                    self.forward(
+                        vec![frame],
+                        ends,
+                        UnitEffects::default(),
+                        None,
+                        None,
+                        None,
+                        Bytes::new(),
+                    )
+                    .await?;
                 }
             }
             b'H' => {
                 if self.open_forward {
                     self.write_up(&[frame]).await?;
                 } else {
-                    self.forward(vec![frame], false, UnitEffects::unknown(), None, None, None, Bytes::new()).await?;
+                    self.forward(
+                        vec![frame],
+                        false,
+                        UnitEffects::unknown(),
+                        None,
+                        None,
+                        None,
+                        Bytes::new(),
+                    )
+                    .await?;
                 }
             }
             b'X' => {
@@ -700,7 +788,18 @@ impl Session {
             }
             // COPY data and anything else belongs to the unit already in progress.
             b'd' | b'c' | b'f' => self.write_up(&[frame]).await?,
-            b'F' => self.forward(vec![frame], true, UnitEffects::unknown(), None, None, None, Bytes::new()).await?,
+            b'F' => {
+                self.forward(
+                    vec![frame],
+                    true,
+                    UnitEffects::unknown(),
+                    None,
+                    None,
+                    None,
+                    Bytes::new(),
+                )
+                .await?
+            }
             _ => self.write_up(&[frame]).await?,
         }
         Ok(true)
@@ -729,16 +828,31 @@ impl Session {
         prefix: Bytes,
     ) -> std::io::Result<()> {
         if !self.open_forward {
-            self.push_unit(Up::Forward { prefix, fx, capture, done, started: Instant::now(), timing_key });
+            self.push_unit(Up::Forward {
+                prefix,
+                fx,
+                capture,
+                done,
+                started: Instant::now(),
+                timing_key,
+            });
         }
         self.open_forward = !ends_unit;
         self.write_up(&frames).await
     }
 
     /// Run frames on the session with the responses kept from the client.
-    async fn swallow(&mut self, frames: Vec<Frame>, fx: UnitEffects) -> std::io::Result<oneshot::Receiver<Vec<Frame>>> {
+    async fn swallow(
+        &mut self,
+        frames: Vec<Frame>,
+        fx: UnitEffects,
+    ) -> std::io::Result<oneshot::Receiver<Vec<Frame>>> {
         let (tx, rx) = oneshot::channel();
-        self.push_unit(Up::Swallow { fx, frames: Vec::new(), kind: SwallowKind::Frames(tx) });
+        self.push_unit(Up::Swallow {
+            fx,
+            frames: Vec::new(),
+            kind: SwallowKind::Frames(tx),
+        });
         self.write_up(&frames).await?;
         Ok(rx)
     }
@@ -765,7 +879,10 @@ impl Session {
         for f in frames.iter().filter(|f| f.tag == b'C') {
             if let Some(c) = f.decode::<protocol::Close>() {
                 if c.target_type == b'S' {
-                    self.st.lock().statements.remove(c.name.as_deref().unwrap_or(""));
+                    self.st
+                        .lock()
+                        .statements
+                        .remove(c.name.as_deref().unwrap_or(""));
                 }
             }
         }
@@ -779,13 +896,21 @@ impl Session {
         }
         {
             let mut st = self.st.lock();
-            if !(st.fp_stale && !st.fp_refreshing && matches!(st.status, b'I' | b'T') && st.pending == 0) {
+            if !(st.fp_stale
+                && !st.fp_refreshing
+                && matches!(st.status, b'I' | b'T')
+                && st.pending == 0)
+            {
                 return Ok(());
             }
             st.fp_refreshing = true;
             st.fp_refresh_gen = self.sh.validator.settings_generation();
         }
-        self.push_unit(Up::Swallow { fx: UnitEffects::default(), frames: Vec::new(), kind: SwallowKind::Fingerprint });
+        self.push_unit(Up::Swallow {
+            fx: UnitEffects::default(),
+            frames: Vec::new(),
+            kind: SwallowKind::Fingerprint,
+        });
         self.write_up(&our_query(FP_SQL, &[])).await
     }
 
@@ -793,19 +918,42 @@ impl Session {
 
     async fn on_simple(&mut self, frame: Frame) -> std::io::Result<()> {
         let Some(q) = frame.decode::<protocol::Query>() else {
-            return self.forward(vec![frame], true, UnitEffects::unknown(), None, None, None, Bytes::new()).await;
+            return self
+                .forward(
+                    vec![frame],
+                    true,
+                    UnitEffects::unknown(),
+                    None,
+                    None,
+                    None,
+                    Bytes::new(),
+                )
+                .await;
         };
         let cls = self.sh.classifier.get(&q.query);
         self.apply_immediate(&cls.effects);
         // A simple query destroys the unnamed prepared statement.
         let drops_unnamed = self.st.lock().statements.remove("").is_some();
         if cls.cacheable.is_some() {
-            let req = Req::Simple { frame, sql: q.query, drops_unnamed };
+            let req = Req::Simple {
+                frame,
+                sql: q.query,
+                drops_unnamed,
+            };
             return self.try_cache(req, cls).await;
         }
         self.bypass(&cls, cls.bypass_reason_or_effect());
         let key = Some(cls.shape);
-        self.forward(vec![frame], true, UnitEffects::from_effects(&cls.effects), None, None, key, Bytes::new()).await
+        self.forward(
+            vec![frame],
+            true,
+            UnitEffects::from_effects(&cls.effects),
+            None,
+            None,
+            key,
+            Bytes::new(),
+        )
+        .await
     }
 
     // ---- extended protocol ----
@@ -822,7 +970,8 @@ impl Session {
                 let mut fx = UnitEffects::from_effects(&cls.effects);
                 fx.parsed = req.parsed();
                 let key = Some(cls.shape);
-                self.forward(req.frames(false), true, fx, None, None, key, Bytes::new()).await
+                self.forward(req.frames(false), true, fx, None, None, key, Bytes::new())
+                    .await
             }
             None => self.forward_batch(frames, true).await,
         }
@@ -830,7 +979,11 @@ impl Session {
 
     /// Forward a batch that is not a cache candidate, tracking what it does.
     async fn forward_batch(&mut self, frames: Vec<Frame>, ends: bool) -> std::io::Result<()> {
-        let mut fx = if ends { UnitEffects::default() } else { UnitEffects::unknown() };
+        let mut fx = if ends {
+            UnitEffects::default()
+        } else {
+            UnitEffects::unknown()
+        };
         let mut local: HashMap<String, StmtInfo> = HashMap::new();
         // The last-read settings are good enough even if stale: the recorded state names
         // exact tables, so a different resolution can only cause a mismatch (no hit). Right
@@ -847,7 +1000,11 @@ impl Session {
                         // Statements prepared now and bound later: remember their tables'
                         // state (read before the Parse reaches Postgres: conservative).
                         let deps = prepared_deps(&self.sh, fp.clone(), &p.query).await;
-                        let info = StmtInfo { sql: Arc::from(p.query.as_str()), param_oids: Arc::from(p.type_oids.as_slice()), deps };
+                        let info = StmtInfo {
+                            sql: Arc::from(p.query.as_str()),
+                            param_oids: Arc::from(p.type_oids.as_slice()),
+                            deps,
+                        };
                         let name = p.name.unwrap_or_default();
                         local.insert(name.clone(), info.clone());
                         fx.parsed.push((name, info));
@@ -857,7 +1014,10 @@ impl Session {
                 b'B' => {
                     let stmt = f.decode::<protocol::Bind>().and_then(|b| {
                         let name = b.statement_name.unwrap_or_default();
-                        local.get(&name).cloned().or_else(|| self.st.lock().statements.get(&name).cloned())
+                        local
+                            .get(&name)
+                            .cloned()
+                            .or_else(|| self.st.lock().statements.get(&name).cloned())
                     });
                     match stmt {
                         Some(info) => {
@@ -874,7 +1034,8 @@ impl Session {
         self.track_closes(&frames);
         self.sh.stats.bypass("extended batch not cacheable");
         Stats::inc(&self.sh.stats.queries);
-        self.forward(frames, ends, fx, None, None, None, Bytes::new()).await
+        self.forward(frames, ends, fx, None, None, None, Bytes::new())
+            .await
     }
 
     /// [Parse] Bind [Describe] Execute Sync, unnamed portal, all rows.
@@ -904,17 +1065,24 @@ impl Session {
                 let p: protocol::Parse = frames[i].decode()?;
                 let pname = p.name.clone().unwrap_or_default();
                 // Re-parsing an existing named statement is an error Postgres must report.
-                if pname != stmt_name || (!pname.is_empty() && self.st.lock().statements.contains_key(&pname)) {
+                if pname != stmt_name
+                    || (!pname.is_empty() && self.st.lock().statements.contains_key(&pname))
+                {
                     return None;
                 }
-                StmtInfo { sql: Arc::from(p.query.as_str()), param_oids: Arc::from(p.type_oids.as_slice()), deps: None }
+                StmtInfo {
+                    sql: Arc::from(p.query.as_str()),
+                    param_oids: Arc::from(p.type_oids.as_slice()),
+                    deps: None,
+                }
             }
             None => self.st.lock().statements.get(&stmt_name)?.clone(),
         };
         let describe = if describe {
             let d: protocol::Describe = frames[off + 1].decode()?;
             let name = d.name.clone().unwrap_or_default();
-            let ok = (d.target_type == b'P' && name.is_empty()) || (d.target_type == b'S' && name == stmt_name);
+            let ok = (d.target_type == b'P' && name.is_empty())
+                || (d.target_type == b'S' && name == stmt_name);
             if !ok {
                 return None;
             }
@@ -922,7 +1090,13 @@ impl Session {
         } else {
             None
         };
-        Some(Req::Extended { frames: frames.to_vec(), parse_idx, stmt, bind, describe })
+        Some(Req::Extended {
+            frames: frames.to_vec(),
+            parse_idx,
+            stmt,
+            bind,
+            describe,
+        })
     }
 
     fn bypass(&self, cls: &Classified, reason: &'static str) {
@@ -1013,7 +1187,17 @@ impl Session {
             Err(reason) => {
                 self.bypass(&cls, reason);
                 let fx = read_fx();
-                return self.forward(req.frames(false), true, fx, None, None, Some(cls.shape), Bytes::new()).await;
+                return self
+                    .forward(
+                        req.frames(false),
+                        true,
+                        fx,
+                        None,
+                        None,
+                        Some(cls.shape),
+                        Bytes::new(),
+                    )
+                    .await;
             }
         };
         Stats::inc(&self.sh.stats.queries);
@@ -1027,7 +1211,10 @@ impl Session {
                 let entry = Arc::new(handle.value().clone());
                 let blocked = if self.sh.rel_disabled(entry.tables.iter().map(|t| t.oid)) {
                     Some("table disabled after verification mismatch")
-                } else if req.prepared_deps().is_some_and(|d| d != Some(&dep_set(&entry.tables))) {
+                } else if req
+                    .prepared_deps()
+                    .is_some_and(|d| d != Some(&dep_set(&entry.tables)))
+                {
                     Some("statement was prepared before its tables last changed")
                 } else {
                     None
@@ -1035,20 +1222,44 @@ impl Session {
                 if let Some(reason) = blocked {
                     self.bypass(&cls, reason);
                     let fx = read_fx();
-                    return self.forward(req.frames(false), true, fx, None, None, Some(cls.shape), Bytes::new()).await;
+                    return self
+                        .forward(
+                            req.frames(false),
+                            true,
+                            fx,
+                            None,
+                            None,
+                            Some(cls.shape),
+                            Bytes::new(),
+                        )
+                        .await;
                 }
                 // The client's Parse (if any) runs on Postgres alongside the check, so the
                 // session's prepared statements stay exactly as without the proxy. A simple
                 // query would have destroyed the unnamed statement: do that too.
                 let parse_rx = match req.parse_frame() {
                     Some(p) => {
-                        let fx = UnitEffects { parsed: req.parsed(), ..Default::default() };
+                        let fx = UnitEffects {
+                            parsed: req.parsed(),
+                            ..Default::default()
+                        };
                         Some(self.swallow(vec![p, protocol::sync_msg()], fx).await?)
                     }
                     None => None,
                 };
-                if matches!(req, Req::Simple { drops_unnamed: true, .. }) {
-                    let _ = self.swallow(vec![protocol::close_msg(b'S', ""), protocol::sync_msg()], UnitEffects::default()).await?;
+                if matches!(
+                    req,
+                    Req::Simple {
+                        drops_unnamed: true,
+                        ..
+                    }
+                ) {
+                    let _ = self
+                        .swallow(
+                            vec![protocol::close_msg(b'S', ""), protocol::sync_msg()],
+                            UnitEffects::default(),
+                        )
+                        .await?;
                 }
                 // Inside a transaction, the query would have locked its tables until the
                 // transaction ends (blocking concurrent DDL and TRUNCATE): take the same
@@ -1056,8 +1267,15 @@ impl Session {
                 // Then confirm the transaction has not written (by any route) and is READ
                 // COMMITTED, so it sees exactly what the check sees.
                 let (lock_rx, txn_rx) = if self.st.lock().status == b'T' {
-                    let l = self.swallow(our_query(&lock_sql(&entry.tables), &[]), UnitEffects::default()).await?;
-                    let t = self.swallow(our_query(TXN_SQL, &[]), UnitEffects::default()).await?;
+                    let l = self
+                        .swallow(
+                            our_query(&lock_sql(&entry.tables), &[]),
+                            UnitEffects::default(),
+                        )
+                        .await?;
+                    let t = self
+                        .swallow(our_query(TXN_SQL, &[]), UnitEffects::default())
+                        .await?;
                     (Some(l), Some(t))
                 } else {
                     (None, None)
@@ -1080,7 +1298,8 @@ impl Session {
                                 f.encode_into(&mut b);
                             }
                             if frames.last().map(|f| f.tag) != Some(b'Z') {
-                                protocol::ready_for_query(self.st.lock().status).encode_into(&mut b);
+                                protocol::ready_for_query(self.st.lock().status)
+                                    .encode_into(&mut b);
                             }
                             return self.local(&b).await;
                         }
@@ -1103,10 +1322,16 @@ impl Session {
                         protocol::ready_for_query(self.st.lock().status).encode_into(&mut b);
                         return self.local(&b).await;
                     }
-                    if frames.is_empty() || frames.iter().any(|f| f.tag == b'N' && notice_is(f, LOCK_FAILED)) {
+                    if frames.is_empty()
+                        || frames
+                            .iter()
+                            .any(|f| f.tag == b'N' && notice_is(f, LOCK_FAILED))
+                    {
                         // Any other problem (table gone, no privilege, deadlock): let Postgres
                         // run the query and report it.
-                        return self.forward_instead(req, &cls, parse_sent, "could not lock tables").await;
+                        return self
+                            .forward_instead(req, &cls, parse_sent, "could not lock tables")
+                            .await;
                     }
                     let ok = match txn {
                         Some((iso, wrote)) => {
@@ -1118,7 +1343,14 @@ impl Session {
                         None => false,
                     };
                     if !ok {
-                        return self.forward_instead(req, &cls, parse_sent, "transaction has written or is not READ COMMITTED").await;
+                        return self
+                            .forward_instead(
+                                req,
+                                &cls,
+                                parse_sent,
+                                "transaction has written or is not READ COMMITTED",
+                            )
+                            .await;
                     }
                 }
                 let verdict = self.sh.validator.check(entry.clone()).await;
@@ -1126,7 +1358,9 @@ impl Session {
                     // The server's configuration changed (seen by this check): this
                     // session's settings must be read again first.
                     self.st.lock().fp_stale = true;
-                    return self.forward_instead(req, &cls, parse_sent, "server settings changed").await;
+                    return self
+                        .forward_instead(req, &cls, parse_sent, "server settings changed")
+                        .await;
                 }
                 if let Verdict::Invalid { meta: true } = verdict {
                     self.st.lock().fp_stale = true;
@@ -1145,7 +1379,9 @@ impl Session {
                         self.sh.record_check(cls.shape, true);
                         let rate = self.sh.cfg.cache.verify_sample_rate;
                         if rate > 0.0 && rand::random::<f64>() < rate {
-                            return self.fill(req, cls, fp, key, request, Some(entry), parse_sent, None).await;
+                            return self
+                                .fill(req, cls, fp, key, request, Some(entry), parse_sent, None)
+                                .await;
                         }
                         let status = self.st.lock().status;
                         let mut b = BytesMut::with_capacity(entry.response.len() + 6);
@@ -1154,8 +1390,12 @@ impl Session {
                         self.local(&b).await?;
                         let stats = &self.sh.stats;
                         Stats::inc(&stats.hits);
-                        stats.hit_bytes.fetch_add(entry.response.len() as u64, Ordering::Relaxed);
-                        stats.saved_micros.fetch_add(entry.exec_micros, Ordering::Relaxed);
+                        stats
+                            .hit_bytes
+                            .fetch_add(entry.response.len() as u64, Ordering::Relaxed);
+                        stats
+                            .saved_micros
+                            .fetch_add(entry.exec_micros, Ordering::Relaxed);
                         tracing::debug!(target: "pgshadow::query", conn = self.conn, outcome = "hit",
                             shape = %format!("{:016x}", cls.shape), micros = started.elapsed().as_micros() as u64,
                             postgres_micros = entry.exec_micros, bytes = entry.response.len());
@@ -1176,13 +1416,17 @@ impl Session {
                     Inflight::Lead(g) => Some(g),
                     Inflight::Wait(_) => None,
                 };
-                return self.fill(req, cls, fp, key, request, None, parse_sent, guard).await;
+                return self
+                    .fill(req, cls, fp, key, request, None, parse_sent, guard)
+                    .await;
             }
             // Miss. Either fill it, or -- if another session is already running this exact
             // query -- wait for its result (which will still be validated) instead.
             match self.sh.claim(key) {
                 Inflight::Lead(guard) => {
-                    return self.fill(req, cls, fp, key, request, None, false, Some(guard)).await;
+                    return self
+                        .fill(req, cls, fp, key, request, None, false, Some(guard))
+                        .await;
                 }
                 Inflight::Wait(mut rx) if !waited => {
                     let budget = self.sh.cfg.check.timeout.max(Duration::from_secs(5));
@@ -1192,7 +1436,8 @@ impl Session {
                 Inflight::Wait(_) => break,
             }
         }
-        self.fill(req, cls, fp, key, request, None, false, None).await
+        self.fill(req, cls, fp, key, request, None, false, None)
+            .await
     }
 
     /// Wait (bounded) until no upstream unit is in flight.
@@ -1213,7 +1458,13 @@ impl Session {
     }
 
     /// Let Postgres answer after all (the client's Parse, if `parse_sent`, already ran).
-    async fn forward_instead(&mut self, req: Req, cls: &Classified, parse_sent: bool, reason: &'static str) -> std::io::Result<()> {
+    async fn forward_instead(
+        &mut self,
+        req: Req,
+        cls: &Classified,
+        parse_sent: bool,
+        reason: &'static str,
+    ) -> std::io::Result<()> {
         self.bypass(cls, reason);
         let mut fx = UnitEffects::from_effects(&cls.effects);
         let prefix = if parse_sent {
@@ -1222,7 +1473,16 @@ impl Session {
             fx.parsed = req.parsed();
             Bytes::new()
         };
-        self.forward(req.frames(parse_sent), true, fx, None, None, Some(cls.shape), prefix).await
+        self.forward(
+            req.frames(parse_sent),
+            true,
+            fx,
+            None,
+            None,
+            Some(cls.shape),
+            prefix,
+        )
+        .await
     }
 
     /// Run the request on Postgres, stream the result to the client, and store it.
@@ -1242,20 +1502,38 @@ impl Session {
         // If the Parse already ran (hit path that fell through), send the rest and put
         // ParseComplete back in front, so the client and the cached bytes see exactly
         // what Postgres would have sent for the whole batch.
-        let prefix = if parse_sent { parse_complete() } else { Bytes::new() };
+        let prefix = if parse_sent {
+            parse_complete()
+        } else {
+            Bytes::new()
+        };
         let mut fx = UnitEffects::from_effects(&cls.effects);
 
         // 1. State of every table the query names, read before the query runs (from the
         //    proxy's own connection, briefly cached). Anything that changes afterwards
         //    changes the fingerprint and fails validation, so earlier is conservative.
-        let rels: Vec<RelName> = cls.cacheable.as_ref().map(|c| c.relations.clone()).unwrap_or_default();
-        let lookup: Vec<(Option<String>, String)> = rels.iter().map(|r| (r.schema.clone(), r.name.clone())).collect();
-        let deps = match self.sh.validator.table_states(&fp.path, &fp.current_user, &lookup).await {
+        let rels: Vec<RelName> = cls
+            .cacheable
+            .as_ref()
+            .map(|c| c.relations.clone())
+            .unwrap_or_default();
+        let lookup: Vec<(Option<String>, String)> = rels
+            .iter()
+            .map(|r| (r.schema.clone(), r.name.clone()))
+            .collect();
+        let deps = match self
+            .sh
+            .validator
+            .table_states(&fp.path, &fp.current_user, &lookup)
+            .await
+        {
             Some(states) => table_deps(&rels, &states),
             None => Err("could not read table state"),
         };
         let deps = match deps {
-            Ok(d) if self.sh.rel_disabled(d.iter().map(|t| t.oid)) => Err("table disabled after verification mismatch"),
+            Ok(d) if self.sh.rel_disabled(d.iter().map(|t| t.oid)) => {
+                Err("table disabled after verification mismatch")
+            }
             Ok(d) if req.prepared_deps().is_some_and(|p| p != Some(&dep_set(&d))) => {
                 Err("statement was prepared before its tables last changed")
             }
@@ -1265,7 +1543,12 @@ impl Session {
         let deps = match deps {
             Ok(d) if !c.clock_columns.is_empty() => {
                 let oids: Vec<u32> = d.iter().map(|t| t.oid).collect();
-                match self.sh.validator.clock_columns(&oids, &c.clock_columns).await {
+                match self
+                    .sh
+                    .validator
+                    .clock_columns(&oids, &c.clock_columns)
+                    .await
+                {
                     Some(false) => Ok(d),
                     Some(true) => Err("casts a non-date/time column to a date/time type"),
                     None => Err("could not check column types"),
@@ -1283,9 +1566,16 @@ impl Session {
                     Err("server settings changed")
                 }
                 Some(ctx) => {
-                    match self.sh.validator.any_shadowed(&ctx.epoch, &c.functions, &c.operators, &c.types).await {
+                    match self
+                        .sh
+                        .validator
+                        .any_shadowed(&ctx.epoch, &c.functions, &c.operators, &c.types)
+                        .await
+                    {
                         Some(false) => Ok((d, ctx)),
-                        Some(true) => Err("uses a name a user-defined function, operator or type shares"),
+                        Some(true) => {
+                            Err("uses a name a user-defined function, operator or type shares")
+                        }
                         None => Err("could not check function and operator names"),
                     }
                 }
@@ -1303,7 +1593,17 @@ impl Session {
                 if !parse_sent {
                     fx.parsed = req.parsed();
                 }
-                return self.forward(req.frames(parse_sent), true, fx, None, None, Some(cls.shape), prefix).await;
+                return self
+                    .forward(
+                        req.frames(parse_sent),
+                        true,
+                        fx,
+                        None,
+                        None,
+                        Some(cls.shape),
+                        prefix,
+                    )
+                    .await;
             }
         };
         if !parse_sent {
@@ -1318,15 +1618,31 @@ impl Session {
         // 3. Inside a transaction: whether it has written (by any route) and its isolation
         //    level, asked right before the query (pipelined: no added latency).
         let txn_rx = if self.st.lock().status == b'T' {
-            Some(self.swallow(our_query(TXN_SQL, &[]), UnitEffects::default()).await?)
+            Some(
+                self.swallow(our_query(TXN_SQL, &[]), UnitEffects::default())
+                    .await?,
+            )
         } else {
             None
         };
 
-        let mut capture = Capture { buf: BytesMut::new(), limit: self.sh.cfg.cache.max_entry_size, clean: true };
+        let mut capture = Capture {
+            buf: BytesMut::new(),
+            limit: self.sh.cfg.cache.max_entry_size,
+            clean: true,
+        };
         capture.buf.extend_from_slice(&prefix);
         let (done_tx, done_rx) = oneshot::channel();
-        self.forward(req.frames(parse_sent), true, fx, Some(capture), Some(done_tx), Some(cls.shape), prefix).await?;
+        self.forward(
+            req.frames(parse_sent),
+            true,
+            fx,
+            Some(capture),
+            Some(done_tx),
+            Some(cls.shape),
+            prefix,
+        )
+        .await?;
 
         let sh = self.sh.clone();
         let st = self.st.clone();
@@ -1347,8 +1663,13 @@ impl Session {
             let outcome = if txn_ok {
                 finish_fill(&sh, deps, &fp, ctx, done, request, key, compare, &cls)
             } else {
-                sh.stats.bypass("transaction has written or is not READ COMMITTED");
-                ("miss", "transaction has written", done.map_or(0, |d| d.elapsed.as_micros() as u64))
+                sh.stats
+                    .bypass("transaction has written or is not READ COMMITTED");
+                (
+                    "miss",
+                    "transaction has written",
+                    done.map_or(0, |d| d.elapsed.as_micros() as u64),
+                )
             };
             tracing::debug!(target: "pgshadow::query", conn, outcome = outcome.0, reason = outcome.1,
                 shape = %format!("{:016x}", cls.shape), postgres_micros = outcome.2);
@@ -1359,20 +1680,33 @@ impl Session {
 }
 
 /// State of the tables a cacheable statement reads, for a session with these settings.
-async fn prepared_deps(sh: &Arc<Shared>, fp: Option<Arc<SessionFp>>, sql: &str) -> Option<Arc<Vec<(u32, String)>>> {
+async fn prepared_deps(
+    sh: &Arc<Shared>,
+    fp: Option<Arc<SessionFp>>,
+    sql: &str,
+) -> Option<Arc<Vec<(u32, String)>>> {
     let fp = fp?;
     if !sh.enabled() || !sh.validator.installed() {
         return None;
     }
     let cls = sh.classifier.get(sql);
     let rels = &cls.cacheable.as_ref()?.relations;
-    let lookup: Vec<(Option<String>, String)> = rels.iter().map(|r| (r.schema.clone(), r.name.clone())).collect();
-    let states = sh.validator.table_states(&fp.path, &fp.current_user, &lookup).await?;
+    let lookup: Vec<(Option<String>, String)> = rels
+        .iter()
+        .map(|r| (r.schema.clone(), r.name.clone()))
+        .collect();
+    let states = sh
+        .validator
+        .table_states(&fp.path, &fp.current_user, &lookup)
+        .await?;
     table_deps(rels, &states).ok().map(|d| dep_set(&d))
 }
 
 /// The tables a result depends on, or why it cannot be cached.
-fn table_deps(rels: &[RelName], states: &[Option<crate::validator::TableState>]) -> Result<Vec<TableDep>, &'static str> {
+fn table_deps(
+    rels: &[RelName],
+    states: &[Option<crate::validator::TableState>],
+) -> Result<Vec<TableDep>, &'static str> {
     let mut deps = Vec::new();
     for (rel, st) in rels.iter().zip(states) {
         match st {
@@ -1408,10 +1742,13 @@ fn finish_fill(
     compare: Option<Arc<Entry>>,
     cls: &Classified,
 ) -> (&'static str, &'static str, u64) {
-    let Some(done) = done else { return ("miss", "connection closed", 0) };
+    let Some(done) = done else {
+        return ("miss", "connection closed", 0);
+    };
     let micros = done.elapsed.as_micros() as u64;
     let Some(response) = done.response else {
-        sh.stats.bypass("result not cacheable (error, notice, or too large)");
+        sh.stats
+            .bypass("result not cacheable (error, notice, or too large)");
         return ("miss", "result not cacheable", micros);
     };
     let entry = Entry {
@@ -1423,7 +1760,11 @@ fn finish_fill(
         tables,
         role: fp.current_user.clone(),
         path: fp.path.clone(),
-        funcs: cls.cacheable.as_ref().map(|c| c.functions.join(",")).unwrap_or_default(),
+        funcs: cls
+            .cacheable
+            .as_ref()
+            .map(|c| c.functions.join(","))
+            .unwrap_or_default(),
         created_unix_ms: now_unix_ms(),
         exec_micros: micros,
     };
@@ -1508,7 +1849,11 @@ fn without_context(f: &Frame) -> Frame {
     let mut out = BytesMut::new();
     let mut i = 0;
     while i < body.len() && body[i] != 0 {
-        let end = body[i + 1..].iter().position(|b| *b == 0).map(|p| i + 1 + p).unwrap_or(body.len());
+        let end = body[i + 1..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|p| i + 1 + p)
+            .unwrap_or(body.len());
         if body[i] != b'W' {
             out.extend_from_slice(&body[i..(end + 1).min(body.len())]);
         }
@@ -1652,7 +1997,13 @@ async fn upstream_reader(
             }
         }
         match unit {
-            Up::Forward { capture, done, started, timing_key, .. } => {
+            Up::Forward {
+                capture,
+                done,
+                started,
+                timing_key,
+                ..
+            } => {
                 if !batch.is_empty() {
                     write_client(&client_w, &batch.split()).await?;
                 }
@@ -1663,7 +2014,9 @@ async fn upstream_reader(
                     }
                 }
                 if let Some(done) = done {
-                    let response = capture.filter(|c| c.clean && !had_error && status != b'E').map(|c| c.buf.freeze());
+                    let response = capture
+                        .filter(|c| c.clean && !had_error && status != b'E')
+                        .map(|c| c.buf.freeze());
                     let _ = done.send(Done { response, elapsed });
                 }
             }
@@ -1730,10 +2083,12 @@ mod tests {
             Frame::new(b'C', Bytes::from(format!("{tag}\0"))).encode_into(&mut b);
             b
         };
-        let mk = |parts: Vec<BytesMut>| parts.into_iter().fold(BytesMut::new(), |mut a, p| {
-            a.extend_from_slice(&p);
-            a
-        });
+        let mk = |parts: Vec<BytesMut>| {
+            parts.into_iter().fold(BytesMut::new(), |mut a, p| {
+                a.extend_from_slice(&p);
+                a
+            })
+        };
         let a = mk(vec![row(b"1"), row(b"2"), cc("SELECT 2")]);
         let b = mk(vec![row(b"2"), row(b"1"), cc("SELECT 2")]);
         let c = mk(vec![row(b"2"), row(b"3"), cc("SELECT 2")]);
@@ -1744,13 +2099,28 @@ mod tests {
     #[test]
     fn fingerprint_parsing() {
         let mut body = BytesMut::new();
-        let cols = ["app", "app", "db", "pg_catalog,public", "0", "read committed", "abc", "1760561538.06", "false", "true", "repeatable read"];
+        let cols = [
+            "app",
+            "app",
+            "db",
+            "pg_catalog,public",
+            "0",
+            "read committed",
+            "abc",
+            "1760561538.06",
+            "false",
+            "true",
+            "repeatable read",
+        ];
         body.put_i16(cols.len() as i16);
         for c in cols {
             body.put_i32(c.len() as i32);
             body.extend_from_slice(c.as_bytes());
         }
-        let frames = vec![Frame::new(b'D', body.freeze()), Frame::new(b'C', Bytes::from_static(b"SELECT 1\0"))];
+        let frames = vec![
+            Frame::new(b'D', body.freeze()),
+            Frame::new(b'C', Bytes::from_static(b"SELECT 1\0")),
+        ];
         let fp = parse_fp(&frames).unwrap();
         assert_eq!(fp.current_user, "app");
         assert_eq!(fp.path, "pg_catalog,public");
@@ -1758,7 +2128,10 @@ mod tests {
         assert_eq!(fp.default_iso, Some(Isolation::ReadCommitted));
         assert_eq!(fp.server, "1760561538.06");
         assert!(!fp.in_recovery);
-        assert_eq!(parse_txn(&frames, 9), Some((Some(Isolation::RepeatableRead), true)));
+        assert_eq!(
+            parse_txn(&frames, 9),
+            Some((Some(Isolation::RepeatableRead), true))
+        );
         assert!(parse_fp(&[protocol::error_frame("ERROR", "42501", "denied")]).is_none());
     }
 }

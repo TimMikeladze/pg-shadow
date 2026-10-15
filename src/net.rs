@@ -46,7 +46,12 @@ impl ServerCertVerifier for NoVerify {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -55,7 +60,12 @@ impl ServerCertVerifier for NoVerify {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -63,7 +73,10 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
-pub fn client_tls_config(mode: TlsMode, ca_file: Option<&str>) -> Result<Arc<rustls::ClientConfig>> {
+pub fn client_tls_config(
+    mode: TlsMode,
+    ca_file: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>> {
     let p = provider();
     let builder = rustls::ClientConfig::builder_with_provider(p.clone())
         .with_safe_default_protocol_versions()
@@ -74,7 +87,9 @@ pub fn client_tls_config(mode: TlsMode, ca_file: Option<&str>) -> Result<Arc<rus
         if let Some(path) = ca_file {
             let pem = std::fs::read(path).with_context(|| format!("reading {path}"))?;
             for cert in rustls_pemfile::certs(&mut &pem[..]) {
-                roots.add(cert.context("parsing CA file")?).context("adding CA certificate")?;
+                roots
+                    .add(cert.context("parsing CA file")?)
+                    .context("adding CA certificate")?;
             }
         }
         builder.with_root_certificates(roots).with_no_client_auth()
@@ -88,9 +103,10 @@ pub fn client_tls_config(mode: TlsMode, ca_file: Option<&str>) -> Result<Arc<rus
 }
 
 pub fn server_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &std::fs::read(cert_path)?[..])
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("parsing {cert_path}"))?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut &std::fs::read(cert_path)?[..])
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("parsing {cert_path}"))?;
     let key = rustls_pemfile::private_key(&mut &std::fs::read(key_path)?[..])
         .with_context(|| format!("parsing {key_path}"))?
         .ok_or_else(|| anyhow!("no private key in {key_path}"))?;
@@ -136,7 +152,11 @@ pub async fn connect_upstream(cfg: &Upstream, tls: &Arc<rustls::ClientConfig>) -
 }
 
 /// Forward a client's CancelRequest packet to Postgres.
-pub async fn send_cancel(cfg: &Upstream, tls: &Arc<rustls::ClientConfig>, packet: &[u8]) -> io::Result<()> {
+pub async fn send_cancel(
+    cfg: &Upstream,
+    tls: &Arc<rustls::ClientConfig>,
+    packet: &[u8],
+) -> io::Result<()> {
     let mut s = connect_upstream(cfg, tls).await.map_err(io::Error::other)?;
     s.write_all(packet).await?;
     s.flush().await?;
@@ -167,7 +187,10 @@ pub async fn connect_plain(
     let mut pg: tokio_postgres::Config = dsn.parse().context("check.dsn")?;
     pg.application_name("pgshadow");
     let client = if mode == TlsMode::Disable {
-        let (client, conn) = pg.connect(tokio_postgres::NoTls).await.context("check connection")?;
+        let (client, conn) = pg
+            .connect(tokio_postgres::NoTls)
+            .await
+            .context("check connection")?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::warn!(error = %e, "check connection closed");

@@ -13,17 +13,33 @@ use crate::common::*;
 use crate::gaps::{agrees, warm};
 
 /// Run `q` a few times and require that nothing was cached or served from cache.
-async fn never_cached(p: &Proxy, c: &tokio_postgres::Client, d: &tokio_postgres::Client, q: &str, what: &str) {
+async fn never_cached(
+    p: &Proxy,
+    c: &tokio_postgres::Client,
+    d: &tokio_postgres::Client,
+    q: &str,
+    what: &str,
+) {
     let (hits, fills) = (p.hits(), p.fills());
     for _ in 0..3 {
-        assert_eq!(simple_rows(c, q).await, simple_rows(d, q).await, "{what}: differs from Postgres");
+        assert_eq!(
+            simple_rows(c, q).await,
+            simple_rows(d, q).await,
+            "{what}: differs from Postgres"
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    assert_eq!((p.hits(), p.fills()), (hits, fills), "{what}: must not be cached");
+    assert_eq!(
+        (p.hits(), p.fills()),
+        (hits, fills),
+        "{what}: must not be cached"
+    );
 }
 
 fn code(e: &tokio_postgres::Error) -> String {
-    e.code().map(|c| c.code().to_string()).unwrap_or_else(|| format!("{e}"))
+    e.code()
+        .map(|c| c.code().to_string())
+        .unwrap_or_else(|| format!("{e}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -40,9 +56,19 @@ async fn partitions_and_inheritance_children_are_refused() {
     )
     .await
     .unwrap();
-    d.batch_execute("DROP TABLE IF EXISTS a_unlogged; CREATE UNLOGGED TABLE a_unlogged (id int)").await.unwrap();
-    for t in ["a_part", "a_part_1", "a_inh_parent", "a_inh_child", "a_unlogged"] {
-        let r = d.execute("SELECT pgshadow.enable($1::text::regclass)", &[&t]).await;
+    d.batch_execute("DROP TABLE IF EXISTS a_unlogged; CREATE UNLOGGED TABLE a_unlogged (id int)")
+        .await
+        .unwrap();
+    for t in [
+        "a_part",
+        "a_part_1",
+        "a_inh_parent",
+        "a_inh_child",
+        "a_unlogged",
+    ] {
+        let r = d
+            .execute("SELECT pgshadow.enable($1::text::regclass)", &[&t])
+            .await;
         assert!(r.is_err(), "{t} must not be accepted");
     }
 }
@@ -66,7 +92,9 @@ async fn user_defined_functions_operators_and_types() {
     // Any new function invalidates (it could change what the same SQL means).
     let q = "SELECT count(*) FROM e_t WHERE grp = 'g1'";
     warm(&p, &c, q).await;
-    d.batch_execute("CREATE FUNCTION public.e_f() RETURNS int LANGUAGE sql AS 'SELECT 1'").await.unwrap();
+    d.batch_execute("CREATE FUNCTION public.e_f() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+        .await
+        .unwrap();
     agrees(&p, &c, &d, q, "user function created").await;
 
     // A user function that takes over a built-in's name is never cached.
@@ -76,11 +104,27 @@ async fn user_defined_functions_operators_and_types() {
     )
     .await
     .unwrap();
-    never_cached(&p, &c, &d, "SELECT lower(name) FROM e_t WHERE id = 1", "shadowed lower()").await;
+    never_cached(
+        &p,
+        &c,
+        &d,
+        "SELECT lower(name) FROM e_t WHERE id = 1",
+        "shadowed lower()",
+    )
+    .await;
 
     // Same for operators.
-    d.batch_execute("CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq)").await.unwrap();
-    never_cached(&p, &c, &d, "SELECT count(*) FROM e_t WHERE id === 1", "user operator").await;
+    d.batch_execute("CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq)")
+        .await
+        .unwrap();
+    never_cached(
+        &p,
+        &c,
+        &d,
+        "SELECT count(*) FROM e_t WHERE id === 1",
+        "user operator",
+    )
+    .await;
 
     // Enum labels are part of the table's fingerprint.
     d.batch_execute(
@@ -92,7 +136,9 @@ async fn user_defined_functions_operators_and_types() {
     .unwrap();
     let q = "SELECT m FROM e_en ORDER BY id";
     warm(&p, &c, q).await;
-    d.batch_execute("ALTER TYPE e_mood RENAME VALUE 'happy' TO 'glad'").await.unwrap();
+    d.batch_execute("ALTER TYPE e_mood RENAME VALUE 'happy' TO 'glad'")
+        .await
+        .unwrap();
     agrees(&p, &c, &d, q, "enum value renamed").await;
 
     // Attributes of a composite column type.
@@ -106,27 +152,48 @@ async fn user_defined_functions_operators_and_types() {
     .unwrap();
     let q = "SELECT to_jsonb(p) FROM e_co";
     warm(&p, &c, q).await;
-    d.batch_execute("ALTER TYPE e_pair RENAME ATTRIBUTE x TO renamed").await.unwrap();
+    d.batch_execute("ALTER TYPE e_pair RENAME ATTRIBUTE x TO renamed")
+        .await
+        .unwrap();
     agrees(&p, &c, &d, q, "composite attribute renamed").await;
 
     // User-defined collations: created later (epoch), and used by name.
     let q = "SELECT grp FROM e_t ORDER BY grp, id";
     warm(&p, &c, q).await;
-    d.batch_execute("DROP COLLATION IF EXISTS public.e_coll; CREATE COLLATION public.e_coll (locale = 'C')").await.unwrap();
+    d.batch_execute(
+        "DROP COLLATION IF EXISTS public.e_coll; CREATE COLLATION public.e_coll (locale = 'C')",
+    )
+    .await
+    .unwrap();
     agrees(&p, &c, &d, q, "collation created").await;
-    never_cached(&p, &c, &d, "SELECT grp FROM e_t ORDER BY grp COLLATE e_coll, id", "user collation").await;
+    never_cached(
+        &p,
+        &c,
+        &d,
+        "SELECT grp FROM e_t ORDER BY grp COLLATE e_coll, id",
+        "user collation",
+    )
+    .await;
 
     // Privileges of a built-in function revoked: Postgres refuses, so must the proxy.
     d.batch_execute("GRANT SELECT ON e_t TO pgs_md5; UPDATE pg_proc SET proacl = NULL WHERE oid = 'upper(text)'::regprocedure")
         .await
         .unwrap();
-    let m = connect_dsn(&format!("host=127.0.0.1 port={} user=pgs_md5 password=md5-pass dbname=shadow_epoch", p.port)).await;
+    let m = connect_dsn(&format!(
+        "host=127.0.0.1 port={} user=pgs_md5 password=md5-pass dbname=shadow_epoch",
+        p.port
+    ))
+    .await;
     let q = "SELECT upper(grp) FROM e_t WHERE id = 1";
     warm(&p, &m, q).await;
-    d.batch_execute("REVOKE EXECUTE ON FUNCTION upper(text) FROM PUBLIC").await.unwrap();
+    d.batch_execute("REVOKE EXECUTE ON FUNCTION upper(text) FROM PUBLIC")
+        .await
+        .unwrap();
     let e = m.simple_query(q).await.unwrap_err();
     assert_eq!(code(&e), "42501", "EXECUTE revoked");
-    d.batch_execute("UPDATE pg_proc SET proacl = NULL WHERE oid = 'upper(text)'::regprocedure").await.unwrap();
+    d.batch_execute("UPDATE pg_proc SET proacl = NULL WHERE oid = 'upper(text)'::regprocedure")
+        .await
+        .unwrap();
 
     // The server's boot token changes (crash recovery, failover, restore): nothing
     // cached before is used.
@@ -167,13 +234,25 @@ async fn writes_and_setting_changes_hidden_in_reads() {
     // Own write, hidden in an operator, inside a transaction: must be visible...
     c.batch_execute("BEGIN").await.unwrap();
     c.batch_execute("SELECT 1 === 1").await.unwrap();
-    assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("101"), "own write must be visible");
+    assert_eq!(
+        simple_rows(&c, q).await[0][0].as_deref(),
+        Some("101"),
+        "own write must be visible"
+    );
     assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("101"));
     // ... and never reach anyone else, before or after a rollback.
     let other = p.client_db("shadow_hidden").await;
-    assert_eq!(simple_rows(&other, q).await[0][0].as_deref(), Some("1"), "uncommitted write leaked");
+    assert_eq!(
+        simple_rows(&other, q).await[0][0].as_deref(),
+        Some("1"),
+        "uncommitted write leaked"
+    );
     c.batch_execute("ROLLBACK").await.unwrap();
-    assert_eq!(simple_rows(&other, q).await[0][0].as_deref(), Some("1"), "rolled-back write leaked");
+    assert_eq!(
+        simple_rows(&other, q).await[0][0].as_deref(),
+        Some("1"),
+        "rolled-back write leaked"
+    );
     assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("1"));
 
     // A view that changes search_path: the next query must resolve names with it.
@@ -183,11 +262,17 @@ async fn writes_and_setting_changes_hidden_in_reads() {
     )
     .await
     .unwrap();
-    c.batch_execute("SET search_path = h_a, public").await.unwrap();
+    c.batch_execute("SET search_path = h_a, public")
+        .await
+        .unwrap();
     let q = "SELECT v FROM h_t";
     warm(&p, &c, q).await;
     c.batch_execute("SELECT * FROM h_sp").await.unwrap();
-    assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("B"), "search_path changed by a view");
+    assert_eq!(
+        simple_rows(&c, q).await[0][0].as_deref(),
+        Some("B"),
+        "search_path changed by a view"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -202,13 +287,20 @@ async fn text_cast_to_dates_and_prepared_statement_shapes() {
     .await
     .unwrap();
     let c = p.client().await;
-    for q in ["SELECT s::timestamptz FROM a_tc", "SELECT (j->>'ts')::timestamptz FROM a_tc"] {
+    for q in [
+        "SELECT s::timestamptz FROM a_tc",
+        "SELECT (j->>'ts')::timestamptz FROM a_tc",
+    ] {
         let (hits, fills) = (p.hits(), p.fills());
         for _ in 0..3 {
             simple_rows(&c, q).await;
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!((p.hits(), p.fills()), (hits, fills), "must not be cached: {q}");
+        assert_eq!(
+            (p.hits(), p.fills()),
+            (hits, fills),
+            "must not be cached: {q}"
+        );
     }
     warm(&p, &c, "SELECT ts::date FROM a_tc").await; // a timestamptz column is fine
 
@@ -219,7 +311,9 @@ async fn text_cast_to_dates_and_prepared_statement_shapes() {
     let q = "SELECT * FROM a_ps WHERE id = 1";
     let stmt = a.prepare(q).await.unwrap();
     a.query(&stmt, &[]).await.unwrap();
-    d.batch_execute("ALTER TABLE a_ps ADD COLUMN extra int DEFAULT 1").await.unwrap();
+    d.batch_execute("ALTER TABLE a_ps ADD COLUMN extra int DEFAULT 1")
+        .await
+        .unwrap();
     let other = p.client().await;
     for _ in 0..3 {
         other.query(q, &[]).await.unwrap();
@@ -227,16 +321,25 @@ async fn text_cast_to_dates_and_prepared_statement_shapes() {
     let direct_a = direct().await;
     let dstmt = direct_a.prepare(q).await.unwrap();
     direct_a.query(&dstmt, &[]).await.unwrap();
-    d.batch_execute("ALTER TABLE a_ps ADD COLUMN extra2 int DEFAULT 2").await.unwrap();
+    d.batch_execute("ALTER TABLE a_ps ADD COLUMN extra2 int DEFAULT 2")
+        .await
+        .unwrap();
     let want = direct_a.query(&dstmt, &[]).await.err().map(|e| code(&e));
     let stmt2 = a.prepare(q).await.unwrap(); // a fresh statement before the second change
     let _ = stmt2;
     for _ in 0..3 {
         other.query(q, &[]).await.unwrap();
     }
-    assert_eq!(want.as_deref(), Some("0A000"), "Postgres refuses the stale statement");
+    assert_eq!(
+        want.as_deref(),
+        Some("0A000"),
+        "Postgres refuses the stale statement"
+    );
     let got = a.query(&stmt, &[]).await.err().map(|e| code(&e));
-    assert_eq!(got, want, "a statement prepared before the change must behave as on Postgres");
+    assert_eq!(
+        got, want,
+        "a statement prepared before the change must behave as on Postgres"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -246,9 +349,18 @@ async fn clock_dependent_parameters_of_any_length() {
     table(&d, "a_tp", 10, true).await;
     let c = p.client().await;
     let (hits, fills) = (p.hits(), p.fills());
-    for v in ["today 10:00", "  Yesterday 23:59:59.999999 +00:00", "tomorrow"] {
+    for v in [
+        "today 10:00",
+        "  Yesterday 23:59:59.999999 +00:00",
+        "tomorrow",
+    ] {
         for _ in 0..3 {
-            c.query("SELECT count(*) FROM a_tp WHERE at > $1::text::timestamptz", &[&v]).await.unwrap();
+            c.query(
+                "SELECT count(*) FROM a_tp WHERE at > $1::text::timestamptz",
+                &[&v],
+            )
+            .await
+            .unwrap();
         }
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -272,25 +384,43 @@ async fn schemas_renamed_created_or_revoked() {
     // A schema-qualified name that comes to mean another table.
     let q = "SELECT count(*) FROM a_sw.t";
     warm(&p, &c, q).await;
-    d.batch_execute("ALTER SCHEMA a_sw RENAME TO a_sw_old; ALTER SCHEMA a_sw_new RENAME TO a_sw").await.unwrap();
+    d.batch_execute("ALTER SCHEMA a_sw RENAME TO a_sw_old; ALTER SCHEMA a_sw_new RENAME TO a_sw")
+        .await
+        .unwrap();
     agrees(&p, &c, &d, q, "schemas swapped").await;
 
     // A schema listed in search_path that does not exist yet, then appears.
     table(&d, "a_lt", 10, true).await;
-    c.batch_execute("SET search_path = a_later, public").await.unwrap();
+    c.batch_execute("SET search_path = a_later, public")
+        .await
+        .unwrap();
     let q = "SELECT count(*) FROM a_lt";
     warm(&p, &c, q).await;
-    d.batch_execute("CREATE SCHEMA a_later; CREATE TABLE a_later.a_lt (id int)").await.unwrap();
-    assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("0"), "must read a_later.a_lt now");
+    d.batch_execute("CREATE SCHEMA a_later; CREATE TABLE a_later.a_lt (id int)")
+        .await
+        .unwrap();
+    assert_eq!(
+        simple_rows(&c, q).await[0][0].as_deref(),
+        Some("0"),
+        "must read a_later.a_lt now"
+    );
     c.batch_execute("RESET search_path").await.unwrap();
 
     // Schema USAGE revoked: Postgres would refuse the query.
     table(&d, "a_us.t", 10, true).await;
-    d.batch_execute("GRANT USAGE ON SCHEMA a_us TO pgs_md5; GRANT SELECT ON a_us.t TO pgs_md5").await.unwrap();
-    let m = connect_dsn(&format!("host=127.0.0.1 port={} user=pgs_md5 password=md5-pass dbname=shadow", p.port)).await;
+    d.batch_execute("GRANT USAGE ON SCHEMA a_us TO pgs_md5; GRANT SELECT ON a_us.t TO pgs_md5")
+        .await
+        .unwrap();
+    let m = connect_dsn(&format!(
+        "host=127.0.0.1 port={} user=pgs_md5 password=md5-pass dbname=shadow",
+        p.port
+    ))
+    .await;
     let q = "SELECT count(*) FROM a_us.t";
     warm(&p, &m, q).await;
-    d.batch_execute("REVOKE USAGE ON SCHEMA a_us FROM pgs_md5").await.unwrap();
+    d.batch_execute("REVOKE USAGE ON SCHEMA a_us FROM pgs_md5")
+        .await
+        .unwrap();
     let e = m.simple_query(q).await.unwrap_err();
     assert_eq!(code(&e), "42501");
 }
@@ -307,14 +437,26 @@ async fn transaction_boundaries_inside_one_message() {
     let q = "SELECT v FROM a_rr WHERE id = 1";
     warm(&p, &c, q).await;
     c.batch_execute("BEGIN").await.unwrap();
-    c.batch_execute("COMMIT; BEGIN ISOLATION LEVEL REPEATABLE READ").await.unwrap();
+    c.batch_execute("COMMIT; BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
     assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("1"));
-    d.batch_execute("UPDATE a_rr SET v = 777 WHERE id = 1").await.unwrap();
-    assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("1"), "repeatable read keeps its snapshot");
+    d.batch_execute("UPDATE a_rr SET v = 777 WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        simple_rows(&c, q).await[0][0].as_deref(),
+        Some("1"),
+        "repeatable read keeps its snapshot"
+    );
     c.batch_execute("COMMIT").await.unwrap();
     let other = p.client().await;
     for client in [&other, &c] {
-        assert_eq!(simple_rows(client, q).await[0][0].as_deref(), Some("777"), "old snapshot was stored");
+        assert_eq!(
+            simple_rows(client, q).await[0][0].as_deref(),
+            Some("777"),
+            "old snapshot was stored"
+        );
     }
 }
 
@@ -332,8 +474,15 @@ async fn hits_inside_transactions_take_table_locks() {
     let hits = p.hits();
     assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("10"));
     assert!(p.hits() > hits, "served from cache");
-    let e = d.batch_execute("SET lock_timeout = '200ms'; TRUNCATE a_lk").await.unwrap_err();
-    assert_eq!(code(&e), "55P03", "TRUNCATE must wait for the reading transaction");
+    let e = d
+        .batch_execute("SET lock_timeout = '200ms'; TRUNCATE a_lk")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(&e),
+        "55P03",
+        "TRUNCATE must wait for the reading transaction"
+    );
     c.batch_execute("COMMIT").await.unwrap();
     d.batch_execute("RESET lock_timeout").await.unwrap();
 
@@ -343,18 +492,25 @@ async fn hits_inside_transactions_take_table_locks() {
     c.batch_execute("SET lock_timeout = '150ms'").await.unwrap();
     warm(&p, &c, q).await;
     let holder = direct().await;
-    holder.batch_execute("BEGIN; LOCK TABLE a_lk2 IN ACCESS EXCLUSIVE MODE").await.unwrap();
+    holder
+        .batch_execute("BEGIN; LOCK TABLE a_lk2 IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
     c.batch_execute("BEGIN").await.unwrap();
     let e = c.simple_query(q).await.unwrap_err();
     assert_eq!(code(&e), "55P03");
-    c.batch_execute("ROLLBACK; RESET lock_timeout; SET statement_timeout = '150ms'").await.unwrap();
+    c.batch_execute("ROLLBACK; RESET lock_timeout; SET statement_timeout = '150ms'")
+        .await
+        .unwrap();
 
     // Timed out (a cancel) while waiting: the same.
     warm(&p, &c, q).await;
     c.batch_execute("BEGIN").await.unwrap();
     let e = c.simple_query(q).await.unwrap_err();
     assert_eq!(code(&e), "57014");
-    c.batch_execute("ROLLBACK; RESET statement_timeout").await.unwrap();
+    c.batch_execute("ROLLBACK; RESET statement_timeout")
+        .await
+        .unwrap();
     holder.batch_execute("ROLLBACK").await.unwrap();
     // The session is still in good shape.
     assert_eq!(simple_rows(&c, q).await[0][0].as_deref(), Some("10"));
@@ -371,7 +527,14 @@ async fn other_databases_are_not_cached() {
     let d = direct().await;
     table(&d, "a_db", 3, true).await;
     let c = p.client_db("shadow_otherdb").await;
-    never_cached(&p, &c, &od, "SELECT count(*) FROM a_db", "session in another database").await;
+    never_cached(
+        &p,
+        &c,
+        &od,
+        "SELECT count(*) FROM a_db",
+        "session in another database",
+    )
+    .await;
 }
 
 // ---- a minimal raw protocol client, for message sequences drivers do not produce ----
@@ -383,7 +546,9 @@ struct RawConn {
 
 impl RawConn {
     async fn connect(port: u16) -> Self {
-        let s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let (r, mut w) = s.into_split();
         let mut body = bytes::BytesMut::new();
         body.put_i32(196608);
@@ -398,7 +563,10 @@ impl RawConn {
         pkt.put_i32(body.len() as i32 + 4);
         pkt.extend_from_slice(&body);
         w.write_all(&pkt).await.unwrap();
-        let mut c = RawConn { rd: FrameReader::new(r), w };
+        let mut c = RawConn {
+            rd: FrameReader::new(r),
+            w,
+        };
         let first = c.until_ready().await;
         assert!(!first.iter().any(|f| f.tag == b'E'), "startup failed");
         c
@@ -411,7 +579,11 @@ impl RawConn {
     async fn until_ready(&mut self) -> Vec<Frame> {
         let mut out = Vec::new();
         loop {
-            let f = tokio::time::timeout(Duration::from_secs(10), self.rd.read_frame()).await.unwrap().unwrap().unwrap();
+            let f = tokio::time::timeout(Duration::from_secs(10), self.rd.read_frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let z = f.tag == b'Z';
             out.push(f);
             if z {
@@ -446,14 +618,23 @@ async fn simple_query_hit_destroys_the_unnamed_statement() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(hit, "never served from cache");
-    c.send(&[protocol::parse_msg("", "SELECT 1"), protocol::sync_msg()]).await;
+    c.send(&[protocol::parse_msg("", "SELECT 1"), protocol::sync_msg()])
+        .await;
     c.until_ready().await;
     let hits = p.hits();
     c.simple(q).await;
     assert!(p.hits() > hits, "served from cache");
     // On Postgres, the simple query destroyed the unnamed statement.
-    c.send(&[protocol::bind_msg("", "", &[]), protocol::execute_msg(""), protocol::sync_msg()]).await;
+    c.send(&[
+        protocol::bind_msg("", "", &[]),
+        protocol::execute_msg(""),
+        protocol::sync_msg(),
+    ])
+    .await;
     let resp = c.until_ready().await;
-    let err = resp.iter().find(|f| f.tag == b'E').expect("Bind of the destroyed unnamed statement must fail");
+    let err = resp
+        .iter()
+        .find(|f| f.tag == b'E')
+        .expect("Bind of the destroyed unnamed statement must fail");
     assert_eq!(protocol::error_fields(&err.body).0, "26000");
 }

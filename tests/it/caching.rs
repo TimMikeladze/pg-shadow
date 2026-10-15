@@ -22,15 +22,31 @@ async fn hits_are_byte_identical_to_postgres() {
         let want_bin = raw_rows(&d.query(*q, &[]).await.unwrap());
         let want_txt = simple_rows(&d, q).await;
         // extended protocol, binary results: first a fill, then a hit
-        assert_eq!(raw_rows(&c.query(*q, &[]).await.unwrap()), want_bin, "fill differs: {q}");
+        assert_eq!(
+            raw_rows(&c.query(*q, &[]).await.unwrap()),
+            want_bin,
+            "fill differs: {q}"
+        );
         p.wait_fills((2 * i + 1) as u64).await;
         let hits = p.hits();
-        assert_eq!(raw_rows(&c.query(*q, &[]).await.unwrap()), want_bin, "hit differs: {q}");
+        assert_eq!(
+            raw_rows(&c.query(*q, &[]).await.unwrap()),
+            want_bin,
+            "hit differs: {q}"
+        );
         assert_eq!(p.hits(), hits + 1, "expected a hit: {q}");
         // simple protocol, text results
-        assert_eq!(simple_rows(&c, q).await, want_txt, "fill differs (text): {q}");
+        assert_eq!(
+            simple_rows(&c, q).await,
+            want_txt,
+            "fill differs (text): {q}"
+        );
         p.wait_fills((2 * i + 2) as u64).await;
-        assert_eq!(simple_rows(&c, q).await, want_txt, "hit differs (text): {q}");
+        assert_eq!(
+            simple_rows(&c, q).await,
+            want_txt,
+            "hit differs (text): {q}"
+        );
         assert_eq!(p.hits(), hits + 2, "expected a text hit: {q}");
     }
 }
@@ -49,15 +65,22 @@ async fn writes_invalidate_immediately() {
     assert_eq!(p.hits(), 1);
 
     // A write from another connection that never touched the proxy.
-    d.execute("UPDATE c_inv SET v = v + 1 WHERE id = 1", &[]).await.unwrap();
-    assert_eq!(sum(simple_rows(&c, q).await), "5051");
-    // A write through the proxy, in a transaction.
-    c.batch_execute("BEGIN; DELETE FROM c_inv WHERE id = 100; COMMIT").await.unwrap();
-    assert_eq!(sum(simple_rows(&c, q).await), "4951");
-    // INSERT ... ON CONFLICT, COPY and TRUNCATE.
-    d.execute("INSERT INTO c_inv (id, grp, v) VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET v = 1000", &[])
+    d.execute("UPDATE c_inv SET v = v + 1 WHERE id = 1", &[])
         .await
         .unwrap();
+    assert_eq!(sum(simple_rows(&c, q).await), "5051");
+    // A write through the proxy, in a transaction.
+    c.batch_execute("BEGIN; DELETE FROM c_inv WHERE id = 100; COMMIT")
+        .await
+        .unwrap();
+    assert_eq!(sum(simple_rows(&c, q).await), "4951");
+    // INSERT ... ON CONFLICT, COPY and TRUNCATE.
+    d.execute(
+        "INSERT INTO c_inv (id, grp, v) VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET v = 1000",
+        &[],
+    )
+    .await
+    .unwrap();
     assert_eq!(sum(simple_rows(&c, q).await), "5949");
     d.batch_execute("TRUNCATE c_inv").await.unwrap();
     assert_eq!(simple_rows(&c, q).await[0][0], None);
@@ -70,17 +93,27 @@ async fn prepared_statements_and_parameters() {
     let d = direct().await;
     table(&d, "c_prep", 100, true).await;
     let c = p.client().await;
-    let st = c.prepare("SELECT count(*) FROM c_prep WHERE grp = $1 AND v > $2").await.unwrap();
+    let st = c
+        .prepare("SELECT count(*) FROM c_prep WHERE grp = $1 AND v > $2")
+        .await
+        .unwrap();
     let n = |r: tokio_postgres::Row| r.get::<_, i64>(0);
     assert_eq!(n(c.query_one(&st, &[&"g1", &10i64]).await.unwrap()), 18);
     p.wait_fills(1).await;
     assert_eq!(n(c.query_one(&st, &[&"g1", &10i64]).await.unwrap()), 18);
     assert_eq!(p.hits(), 1, "same parameters hit");
-    assert_eq!(n(c.query_one(&st, &[&"g1", &50i64]).await.unwrap()), 10, "other parameters are a separate entry");
+    assert_eq!(
+        n(c.query_one(&st, &[&"g1", &50i64]).await.unwrap()),
+        10,
+        "other parameters are a separate entry"
+    );
     assert_eq!(p.hits(), 1);
     // The statement still works for uncached use after hits, and after being closed.
     drop(st);
-    let st2 = c.prepare("SELECT count(*) FROM c_prep WHERE grp = $1 AND v > $2").await.unwrap();
+    let st2 = c
+        .prepare("SELECT count(*) FROM c_prep WHERE grp = $1 AND v > $2")
+        .await
+        .unwrap();
     assert_eq!(n(c.query_one(&st2, &[&"g1", &10i64]).await.unwrap()), 18);
 }
 
@@ -101,27 +134,41 @@ async fn transaction_rules() {
     assert_eq!(v(simple_rows(&c, q).await), "1");
     assert_eq!(p.hits(), h + 1);
     // ... a commit elsewhere is visible to the next statement, as in Postgres.
-    d.execute("UPDATE c_txn SET v = 2 WHERE id = 1", &[]).await.unwrap();
+    d.execute("UPDATE c_txn SET v = 2 WHERE id = 1", &[])
+        .await
+        .unwrap();
     assert_eq!(v(simple_rows(&c, q).await), "2");
     // ... after this transaction writes, it must see its own uncommitted write.
-    c.batch_execute("UPDATE c_txn SET v = 3 WHERE id = 1").await.unwrap();
+    c.batch_execute("UPDATE c_txn SET v = 3 WHERE id = 1")
+        .await
+        .unwrap();
     assert_eq!(v(simple_rows(&c, q).await), "3");
     c.batch_execute("ROLLBACK").await.unwrap();
     assert_eq!(v(simple_rows(&c, q).await), "2");
 
     // REPEATABLE READ: never served from cache, and keeps its snapshot.
     crate::gaps::warm(&p, &c, q).await;
-    c.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.unwrap();
+    c.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
     let h = p.hits();
     assert_eq!(v(simple_rows(&c, q).await), "2");
-    d.execute("UPDATE c_txn SET v = 4 WHERE id = 1", &[]).await.unwrap();
-    assert_eq!(v(simple_rows(&c, q).await), "2", "repeatable read keeps its snapshot");
+    d.execute("UPDATE c_txn SET v = 4 WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        v(simple_rows(&c, q).await),
+        "2",
+        "repeatable read keeps its snapshot"
+    );
     assert_eq!(p.hits(), h, "no cache use under REPEATABLE READ");
     c.batch_execute("COMMIT").await.unwrap();
     assert_eq!(v(simple_rows(&c, q).await), "4");
 
     // Session default isolation changed with SET: no cache use either.
-    c.batch_execute("SET default_transaction_isolation = 'serializable'").await.unwrap();
+    c.batch_execute("SET default_transaction_isolation = 'serializable'")
+        .await
+        .unwrap();
     let h = p.hits();
     simple_rows(&c, q).await;
     simple_rows(&c, q).await;
@@ -134,7 +181,9 @@ async fn only_safe_queries_are_cached() {
     let d = direct().await;
     table(&d, "c_safe", 10, true).await;
     table(&d, "c_plain", 10, false).await;
-    d.batch_execute("CREATE OR REPLACE VIEW c_view AS SELECT * FROM c_safe").await.unwrap();
+    d.batch_execute("CREATE OR REPLACE VIEW c_view AS SELECT * FROM c_safe")
+        .await
+        .unwrap();
     let c = p.client().await;
     for q in [
         "SELECT now(), count(*) FROM c_safe",
@@ -150,7 +199,10 @@ async fn only_safe_queries_are_cached() {
         c.batch_execute("COMMIT").await.unwrap();
     }
     // 'now' as a bound parameter value
-    let st = c.prepare("SELECT count(*) FROM c_safe WHERE at < $1::text::timestamptz").await.unwrap();
+    let st = c
+        .prepare("SELECT count(*) FROM c_safe WHERE at < $1::text::timestamptz")
+        .await
+        .unwrap();
     c.query(&st, &[&"now"]).await.unwrap();
     c.query(&st, &[&"now"]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -178,15 +230,25 @@ async fn disk_tier_survives_restart() {
     let c = p.client().await;
     let want = simple_rows(&d, q).await;
     assert_eq!(simple_rows(&c, q).await, want);
-    assert_eq!(p.hits(), 1, "served from the disk tier after restart (and validated)");
+    assert_eq!(
+        p.hits(),
+        1,
+        "served from the disk tier after restart (and validated)"
+    );
     // ... and still invalidated by writes made while it was down.
     p.app.shutdown().await;
     drop(p);
-    d.execute("UPDATE c_disk SET amount = 0 WHERE id = 1", &[]).await.unwrap();
+    d.execute("UPDATE c_disk SET amount = 0 WHERE id = 1", &[])
+        .await
+        .unwrap();
     let p = proxy_from(cfg, Some(dir)).await;
     let c = p.client().await;
     assert_eq!(simple_rows(&c, q).await, simple_rows(&d, q).await);
-    assert_eq!(p.hits(), 0, "a write while the proxy was down invalidates the stored result");
+    assert_eq!(
+        p.hits(),
+        0,
+        "a write while the proxy was down invalidates the stored result"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

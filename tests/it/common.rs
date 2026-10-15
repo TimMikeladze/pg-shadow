@@ -8,7 +8,8 @@ use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, NoTls};
 
 pub fn pg_dsn() -> String {
-    std::env::var("PGSHADOW_TEST_PG").unwrap_or_else(|_| "host=127.0.0.1 port=5433 user=postgres dbname=shadow".into())
+    std::env::var("PGSHADOW_TEST_PG")
+        .unwrap_or_else(|_| "host=127.0.0.1 port=5433 user=postgres dbname=shadow".into())
 }
 
 fn pg_host_port() -> (String, u16) {
@@ -28,7 +29,9 @@ pub async fn direct() -> Client {
 }
 
 pub async fn connect_dsn(dsn: &str) -> Client {
-    let (c, conn) = tokio_postgres::connect(dsn, NoTls).await.unwrap_or_else(|e| panic!("connect {dsn}: {e}"));
+    let (c, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .unwrap_or_else(|e| panic!("connect {dsn}: {e}"));
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -45,23 +48,36 @@ pub struct Proxy {
 /// to a database, like trimming the changelog.
 pub async fn isolated_db(name: &str) -> String {
     let d = direct().await;
-    let exists = d.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name]).await.unwrap().is_some();
+    let exists = d
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name])
+        .await
+        .unwrap()
+        .is_some();
     if !exists {
         let _ = d.batch_execute(&format!("CREATE DATABASE {name}")).await;
     }
     let dsn = pg_dsn().replace("dbname=shadow", &format!("dbname={name}"));
     let c = connect_dsn(&dsn).await;
-    c.batch_execute(pgshadow::admin::SCHEMA_SQL).await.expect("install pgshadow schema");
+    c.batch_execute(pgshadow::admin::SCHEMA_SQL)
+        .await
+        .expect("install pgshadow schema");
     dsn
 }
 
 impl Proxy {
     pub fn dsn(&self) -> String {
-        format!("host=127.0.0.1 port={} user=postgres dbname=shadow", self.port)
+        format!(
+            "host=127.0.0.1 port={} user=postgres dbname=shadow",
+            self.port
+        )
     }
 
     pub async fn client_db(&self, db: &str) -> Client {
-        connect_dsn(&format!("host=127.0.0.1 port={} user=postgres dbname={db}", self.port)).await
+        connect_dsn(&format!(
+            "host=127.0.0.1 port={} user=postgres dbname={db}",
+            self.port
+        ))
+        .await
     }
 
     pub async fn client(&self) -> Client {
@@ -80,7 +96,11 @@ impl Proxy {
     pub async fn wait_fills(&self, n: u64) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.fills() < n {
-            assert!(Instant::now() < deadline, "expected {n} fills, have {}", self.fills());
+            assert!(
+                Instant::now() < deadline,
+                "expected {n} fills, have {}",
+                self.fills()
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -112,7 +132,9 @@ pub async fn proxy_with(tweak: impl FnOnce(&mut Config)) -> Proxy {
     INSTALLED
         .get_or_init(|| async {
             let c = direct().await;
-            c.batch_execute(pgshadow::admin::SCHEMA_SQL).await.expect("install pgshadow schema");
+            c.batch_execute(pgshadow::admin::SCHEMA_SQL)
+                .await
+                .expect("install pgshadow schema");
         })
         .await;
     let mut cfg = base_config();
@@ -124,19 +146,28 @@ pub async fn proxy_from(cfg: Config, dir: Option<tempfile::TempDir>) -> Proxy {
     INSTALLED
         .get_or_init(|| async {
             let c = direct().await;
-            c.batch_execute(pgshadow::admin::SCHEMA_SQL).await.expect("install pgshadow schema");
+            c.batch_execute(pgshadow::admin::SCHEMA_SQL)
+                .await
+                .expect("install pgshadow schema");
         })
         .await;
     let app = app::start(cfg).await.expect("start proxy");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !app.shared.validator.ready() {
-        assert!(Instant::now() < deadline, "check connections never became ready");
+        assert!(
+            Instant::now() < deadline,
+            "check connections never became ready"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     app.spawn(listener);
-    Proxy { app, port, _dir: dir }
+    Proxy {
+        app,
+        port,
+        _dir: dir,
+    }
 }
 
 /// A fresh table, filled and opted in. Names must be unique per test.
@@ -153,7 +184,9 @@ pub async fn table(c: &Client, name: &str, rows: i32, enable: bool) {
     .await
     .unwrap();
     if enable {
-        c.execute("SELECT pgshadow.enable($1::text::regclass)", &[&name]).await.unwrap();
+        c.execute("SELECT pgshadow.enable($1::text::regclass)", &[&name])
+            .await
+            .unwrap();
     }
 }
 
@@ -174,7 +207,9 @@ impl<'a> FromSql<'a> for Raw {
 }
 
 pub fn raw_rows(rows: &[tokio_postgres::Row]) -> Vec<Vec<Raw>> {
-    rows.iter().map(|r| (0..r.len()).map(|i| r.get::<_, Raw>(i)).collect()).collect()
+    rows.iter()
+        .map(|r| (0..r.len()).map(|i| r.get::<_, Raw>(i)).collect())
+        .collect()
 }
 
 pub async fn simple_rows(c: &Client, sql: &str) -> Vec<Vec<Option<String>>> {

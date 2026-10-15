@@ -160,10 +160,10 @@ Measured with pgbench on a 2-vCPU sandbox, with Postgres 16, the proxy and pgben
 ## Development
 
 ```bash
-bench/dev-postgres.sh                      # local Postgres 16 on :5433 with test roles and TLS
+bench/dev-postgres.sh                      # local Postgres 16 on :5433 with test roles and TLS (Docker container when there is no system PG 16)
 cargo test --lib                           # unit tests (classifier, protocol, cache encoding, ...)
 cargo test --test it -- --test-threads 8   # integration: real Postgres through the proxy
-bench/sql-check.sh                         # pgshadow.validate() scenarios directly in SQL
+PGHOST=127.0.0.1 bench/sql-check.sh        # pgshadow.validate() scenarios directly in SQL
 python3 -m pytest -q py_tests              # psycopg + SQLAlchemy through the proxy
 PGSHADOW_BIN=./target/release/pgshadow dev/proxy.sh restart dev/bench.toml && bench/bench.sh
 ```

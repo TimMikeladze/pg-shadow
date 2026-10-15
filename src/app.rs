@@ -27,7 +27,9 @@ pub async fn start(cfg: Config) -> Result<App> {
     let stats = Arc::new(Stats::default());
     let shared = Shared::new(cfg.clone(), store.clone(), validator, stats.clone(), tls);
     let server = Arc::new(Server::new(shared.clone())?);
-    observe::spawn_summary(stats, cfg.log.summary_interval, move || store.memory_usage());
+    observe::spawn_summary(stats, cfg.log.summary_interval, move || {
+        store.memory_usage()
+    });
     admin::spawn_trimmer(cfg.clone());
     let sh = shared.clone();
     let admin_addr = cfg.admin.addr.clone();

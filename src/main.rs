@@ -37,7 +37,9 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(cli.config.as_deref())?;
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         match cli.cmd {
             Cmd::Serve => serve(cfg).await,
@@ -78,7 +80,8 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("signal handler");
         tokio::select! {
             _ = ctrl_c => {}
             _ = term.recv() => {}
