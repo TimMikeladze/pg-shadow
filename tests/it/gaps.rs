@@ -5,7 +5,11 @@ use crate::common::*;
 
 /// Run `q` through the proxy until it is served from cache.
 pub async fn warm(p: &Proxy, c: &tokio_postgres::Client, q: &str) {
-    for _ in 0..3 {
+    for attempt in 0..6 {
+        if attempt >= 2 {
+            // e.g. a table just enabled: the proxy re-reads table state shortly
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
         let (hits, fills) = (p.hits(), p.fills());
         simple_rows(c, q).await;
         if p.hits() > hits {
@@ -23,7 +27,7 @@ pub async fn warm(p: &Proxy, c: &tokio_postgres::Client, q: &str) {
 }
 
 /// The proxy's answer must equal Postgres's answer right now.
-async fn agrees(p: &Proxy, c: &tokio_postgres::Client, d: &tokio_postgres::Client, q: &str, what: &str) {
+pub async fn agrees(p: &Proxy, c: &tokio_postgres::Client, d: &tokio_postgres::Client, q: &str, what: &str) {
     let hits = p.hits();
     let got = simple_rows(c, q).await;
     let want = simple_rows(d, q).await;

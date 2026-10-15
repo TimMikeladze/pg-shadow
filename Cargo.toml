@@ -1,4 +1,5 @@
 [package]
+autobenches = false
 name = "pgshadow"
 version = "0.1.0"
 edition = "2021"
@@ -51,3 +52,15 @@ debug = 1
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
+
+[[example]]
+name = "micro"
+path = "benches/micro.rs"
+
+[[example]]
+name = "fpcheck"
+path = "benches/fpcheck.rs"
+
+[[example]]
+name = "latency"
+path = "benches/latency.rs"

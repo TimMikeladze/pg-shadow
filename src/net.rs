@@ -151,13 +151,11 @@ pub async fn connect_check(
     mode: TlsMode,
     tls: &Arc<rustls::ClientConfig>,
 ) -> Result<tokio_postgres::Client> {
-    let client = connect_plain(dsn, mode, tls).await?;
-    // Plans of the check functions are cached per connection; keep its environment fixed.
-    client
-        .batch_execute("SET search_path = pg_catalog, pg_temp; SET TimeZone = 'UTC'")
-        .await
-        .context("configuring check connection")?;
-    Ok(client)
+    // No session settings are overridden: pgshadow.settings_hash() on these connections
+    // must see the server's configured values, to notice configuration reloads. (All of
+    // pgshadow's functions pin their own search_path, and the proxy's queries qualify
+    // every name.)
+    connect_plain(dsn, mode, tls).await
 }
 
 /// tokio-postgres connection with the configured TLS, default session settings.

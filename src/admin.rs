@@ -46,7 +46,7 @@ pub async fn uninstall(cfg: &Config) -> Result<()> {
 pub async fn enable(cfg: &Config, tables: &[String]) -> Result<()> {
     let c = client(cfg).await?;
     for t in tables {
-        c.execute("SELECT pgshadow.enable($1::text::regclass)", &[t])
+        c.execute("SELECT pgshadow.enable($1::pg_catalog.text::pg_catalog.regclass)", &[t])
             .await
             .with_context(|| format!("enabling {t}"))?;
         println!("{t}: cached");
@@ -57,7 +57,7 @@ pub async fn enable(cfg: &Config, tables: &[String]) -> Result<()> {
 pub async fn disable(cfg: &Config, tables: &[String]) -> Result<()> {
     let c = client(cfg).await?;
     for t in tables {
-        c.execute("SELECT pgshadow.disable($1::text::regclass)", &[t])
+        c.execute("SELECT pgshadow.disable($1::pg_catalog.text::pg_catalog.regclass)", &[t])
             .await
             .with_context(|| format!("disabling {t}"))?;
         println!("{t}: no longer cached");
@@ -112,7 +112,7 @@ async fn trim_loop(cfg: &Config) -> Result<()> {
         if !leader {
             continue;
         }
-        let n: i64 = c.query_one("SELECT pgshadow.trim($1::text::interval)", &[&keep]).await?.get(0);
+        let n: i64 = c.query_one("SELECT pgshadow.trim($1::pg_catalog.text::pg_catalog.interval)", &[&keep]).await?.get(0);
         if n > 0 {
             tracing::debug!(removed = n, "changelog trimmed");
         }

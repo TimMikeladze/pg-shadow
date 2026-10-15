@@ -8,3 +8,4 @@ mod basics;
 mod caching;
 mod gaps;
 mod staleness;
+mod audit;

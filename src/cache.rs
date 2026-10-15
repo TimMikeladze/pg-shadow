@@ -1,8 +1,9 @@
 //! Cached results, stored in a foyer hybrid cache (memory, optionally spilling to disk).
 //!
 //! An entry holds Postgres's raw response bytes for one request plus what is needed to
-//! prove it is still valid: the snapshot it was read under, and for each table the
-//! catalog fingerprint and (for unqualified names) how the name was resolved.
+//! prove it is still valid: the snapshot it was read under, the catalog epoch and
+//! formatting settings, and for each table its catalog fingerprint and the reference
+//! that resolved to it.
 //!
 //! Correctness never depends on this store: every hit is re-validated against Postgres
 //! before it is served, entries carry a checksum, and the full request bytes are
@@ -29,10 +30,12 @@ pub struct TableDep {
     pub oid: u32,
     /// pgshadow.rel_state(oid).fp when the result was read.
     pub fp: String,
-    /// For unqualified references: the name and the session's schema list
-    /// (comma-separated, current_schemas(true)), so the check can confirm the name still
-    /// resolves to this table.
-    pub resolve: Option<(String, String)>,
+    /// The reference as written (schema if qualified, and name); the check confirms it
+    /// still resolves to this table for the entry's search_path and role.
+    pub nsp: Option<String>,
+    pub name: String,
+    /// Schema-qualified, quoted name, for locking the table inside transactions.
+    pub lock_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,18 +44,25 @@ pub struct Entry {
     pub request: Bytes,
     /// Response frames exactly as Postgres sent them, without the final ReadyForQuery.
     pub response: Bytes,
-    /// pg_current_snapshot() taken on the same session before the query ran.
+    /// pg_current_snapshot(), taken before the query was sent.
     pub snapshot: String,
+    /// pgshadow.catalog_epoch() and settings_hash() at the same time.
+    pub epoch: String,
+    pub settings: String,
     pub tables: Vec<TableDep>,
-    /// Role whose SELECT privilege is re-checked before serving (current_user).
+    /// Role whose privileges are re-checked before serving (current_user).
     pub role: String,
+    /// The session's search_path setting, for re-resolving names.
+    pub path: String,
+    /// Built-in functions the query calls (comma-separated), whose privileges are re-checked.
+    pub funcs: String,
     pub created_unix_ms: u64,
     /// How long Postgres took, for logs.
     pub exec_micros: u64,
 }
 
 const MAGIC: u32 = 0x5047_5348; // "PGSH"
-const VERSION: u8 = 1;
+const VERSION: u8 = 3;
 
 fn io_err(e: impl std::fmt::Display) -> foyer::Error {
     foyer::Error::io_error(std::io::Error::other(e.to_string()))
@@ -114,21 +124,26 @@ impl Code for Entry {
             w.bytes(&self.request)?;
             w.bytes(&self.response)?;
             w.bytes(self.snapshot.as_bytes())?;
+            w.bytes(self.epoch.as_bytes())?;
+            w.bytes(self.settings.as_bytes())?;
             w.bytes(self.role.as_bytes())?;
+            w.bytes(self.path.as_bytes())?;
+            w.bytes(self.funcs.as_bytes())?;
             w.u64(self.created_unix_ms)?;
             w.u64(self.exec_micros)?;
             w.u64(self.tables.len() as u64)?;
             for t in &self.tables {
                 w.u64(t.oid as u64)?;
                 w.bytes(t.fp.as_bytes())?;
-                match &t.resolve {
+                match &t.nsp {
                     None => w.raw(&[0])?,
-                    Some((name, schemas)) => {
+                    Some(nsp) => {
                         w.raw(&[1])?;
-                        w.bytes(name.as_bytes())?;
-                        w.bytes(schemas.as_bytes())?;
+                        w.bytes(nsp.as_bytes())?;
                     }
                 }
+                w.bytes(t.name.as_bytes())?;
+                w.bytes(t.lock_name.as_bytes())?;
             }
             let crc = w.crc.clone().finalize();
             w.w.write_all(&crc.to_le_bytes())
@@ -147,7 +162,11 @@ impl Code for Entry {
             let request = Bytes::from(r.bytes()?);
             let response = Bytes::from(r.bytes()?);
             let snapshot = r.string()?;
+            let epoch = r.string()?;
+            let settings = r.string()?;
             let role = r.string()?;
+            let path = r.string()?;
+            let funcs = r.string()?;
             let created_unix_ms = r.u64()?;
             let exec_micros = r.u64()?;
             let n = r.u64()?;
@@ -158,14 +177,16 @@ impl Code for Entry {
             for _ in 0..n {
                 let oid = r.u64()? as u32;
                 let fp = r.string()?;
-                let resolve = match r.raw(1)?[0] {
+                let nsp = match r.raw(1)?[0] {
                     0 => None,
-                    1 => Some((r.string()?, r.string()?)),
+                    1 => Some(r.string()?),
                     _ => return Err(std::io::Error::other("bad entry")),
                 };
-                tables.push(TableDep { oid, fp, resolve });
+                let name = r.string()?;
+                let lock_name = r.string()?;
+                tables.push(TableDep { oid, fp, nsp, name, lock_name });
             }
-            Ok(Entry { request, response, snapshot, tables, role, created_unix_ms, exec_micros })
+            Ok(Entry { request, response, snapshot, epoch, settings, tables, role, path, funcs, created_unix_ms, exec_micros })
         })()
         .map_err(foyer::Error::io_error)?;
         let expected = r.crc.clone().finalize();
@@ -181,11 +202,15 @@ impl Code for Entry {
         64 + self.request.len()
             + self.response.len()
             + self.snapshot.len()
+            + self.epoch.len()
+            + self.settings.len()
             + self.role.len()
+            + self.path.len()
+            + self.funcs.len()
             + self
                 .tables
                 .iter()
-                .map(|t| 24 + t.fp.len() + t.resolve.as_ref().map_or(0, |(a, b)| a.len() + b.len()))
+                .map(|t| 64 + t.fp.len() + t.nsp.as_ref().map_or(0, String::len) + t.name.len() + t.lock_name.len())
                 .sum::<usize>()
     }
 }
@@ -290,11 +315,15 @@ mod tests {
             request: Bytes::from_static(b"Q\0SELECT 1"),
             response: Bytes::from_static(b"T....D....C...."),
             snapshot: "100:105:101,103".into(),
+            epoch: "3:900|0:0|1:880|0:0".into(),
+            settings: "d41d8cd98f00b204e9800998ecf8427e".into(),
             tables: vec![
-                TableDep { oid: 16384, fp: "abc|r|f".into(), resolve: Some(("orders".into(), "pg_catalog,public".into())) },
-                TableDep { oid: 16390, fp: "def".into(), resolve: None },
+                TableDep { oid: 16384, fp: "abc|r|f".into(), nsp: None, name: "orders".into(), lock_name: "public.orders".into() },
+                TableDep { oid: 16390, fp: "def".into(), nsp: Some("app".into()), name: "Items".into(), lock_name: "app.\"Items\"".into() },
             ],
             role: "app".into(),
+            path: "\"$user\", public".into(),
+            funcs: "lower,upper".into(),
             created_unix_ms: 1_700_000_000_000,
             exec_micros: 1234,
         }

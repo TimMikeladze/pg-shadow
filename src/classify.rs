@@ -58,7 +58,11 @@ pub enum Effect {
     Read,
     /// BEGIN / START TRANSACTION, with an explicit isolation level if one was given.
     Begin(Option<Isolation>),
-    /// COMMIT, ROLLBACK, SAVEPOINT, RELEASE, ROLLBACK TO: no effect on settings.
+    /// SHOW: reads a setting, runs no user code.
+    Show,
+    /// COMMIT or ROLLBACK: ends the transaction.
+    TxnEnd,
+    /// SAVEPOINT, RELEASE, ROLLBACK TO: no effect on settings or transaction boundaries.
     TxnControl,
     /// INSERT/UPDATE/DELETE/MERGE using only allowlisted functions: writes data,
     /// leaves settings alone.
@@ -86,6 +90,14 @@ pub struct Classified {
 #[derive(Debug, Clone)]
 pub struct Cacheable {
     pub relations: Vec<RelName>,
+    /// Names the query relies on being the built-in ones. The proxy checks, per database,
+    /// that no user-defined object could take any of them over (see pgshadow.shadowed).
+    pub functions: Vec<String>,
+    pub operators: Vec<String>,
+    /// Type and collation names.
+    pub types: Vec<String>,
+    /// Columns cast to a date/time type: the proxy confirms they are date/time columns.
+    pub clock_columns: Vec<String>,
 }
 
 impl Classified {
@@ -95,7 +107,7 @@ impl Classified {
 
     /// True if no statement could have written data.
     pub fn is_read_only(&self) -> bool {
-        self.effects.iter().all(|e| matches!(e, Effect::Read | Effect::TxnControl | Effect::Begin(_)))
+        self.effects.iter().all(|e| matches!(e, Effect::Read | Effect::Show | Effect::TxnControl | Effect::TxnEnd | Effect::Begin(_)))
     }
 
     /// True if a statement might have changed session settings or state.
@@ -159,7 +171,7 @@ const SAFE_FUNCTIONS: &[&str] = &[
     "array_sort", "trim_array", "generate_series", "generate_subscripts",
     // misc
     "coalesce", "nullif", "greatest", "least", "num_nulls", "num_nonnulls",
-    "pg_typeof", "format_type", "num_nulls", "host", "masklen", "network", "family",
+    "host", "masklen", "network", "family",
     "lower_inf", "upper_inf", "isempty", "range_merge",
 ];
 
@@ -180,10 +192,16 @@ const READ_ONLY_UNCACHEABLE: &[&str] = &[
 /// Literal strings that Postgres turns into the current time when cast to a date/time type.
 const TIME_WORDS: &[&str] = &["now", "today", "tomorrow", "yesterday"];
 
+/// Whether a string could be (or contain) a date/time keyword Postgres evaluates against
+/// the clock: 'now', 'today 10:00', ' Yesterday', ... Matched as a substring, ignoring case.
 pub fn is_time_word(s: &str) -> bool {
-    let t = s.trim();
-    TIME_WORDS.iter().any(|w| t.eq_ignore_ascii_case(w))
+    let lower = s.to_ascii_lowercase();
+    TIME_WORDS.iter().any(|w| lower.contains(w))
 }
+
+/// Date/time target types: casting text to these can read the clock.
+const DATETIME_TYPES: &[&str] = &["timestamp", "timestamptz", "date", "time", "timetz"];
+
 
 fn safe_functions() -> &'static HashSet<&'static str> {
     use std::sync::OnceLock;
@@ -206,6 +224,15 @@ fn read_only_functions() -> &'static HashSet<&'static str> {
 #[derive(Default, Debug)]
 struct Scan {
     funcs: Vec<Vec<String>>,
+    operators: Vec<String>,
+    cast_types: Vec<Vec<String>>,
+    /// A cast to a date/time type of something that could be text at run time.
+    clock_cast: bool,
+    /// Column names cast to a date/time type: fine only if they are date/time columns.
+    clock_columns: Vec<String>,
+    collations: Vec<String>,
+    /// A cast to a catalog-name type (regclass, regtype, ...).
+    reg_cast: bool,
     time_sql_value_function: bool,
     time_literal: bool,
     locking: bool,
@@ -264,10 +291,56 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
                         }
                     }
                     "AConst" => {
+                        // the parser's decoded value, so escapes cannot hide a time word
                         if let Some(s) = val.pointer("/val/Sval/sval").and_then(Value::as_str) {
                             if is_time_word(s) {
                                 out.time_literal = true;
                             }
+                        }
+                    }
+                    "AExpr" => {
+                        if let Some(names) = val.get("name").and_then(Value::as_array) {
+                            for n in names {
+                                if let Some(op) = n.pointer("/node/String/sval").and_then(Value::as_str) {
+                                    out.operators.push(op.to_string());
+                                }
+                            }
+                        }
+                    }
+                    "TypeCast" => {
+                        let names: Vec<String> = val
+                            .pointer("/type_name/names")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|n| n.pointer("/node/String/sval").and_then(Value::as_str))
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(last) = names.last() {
+                            let base = last.trim_start_matches('_');
+                            if base.starts_with("reg") {
+                                out.reg_cast = true;
+                            }
+                            if DATETIME_TYPES.contains(&base) {
+                                match val.get("arg") {
+                                    Some(arg) if datetime_safe(arg, &mut out.clock_columns) => {}
+                                    _ => out.clock_cast = true,
+                                }
+                            }
+                        }
+                        out.cast_types.push(names);
+                    }
+                    "CollateClause" => {
+                        if let Some(n) = val
+                            .get("collname")
+                            .and_then(Value::as_array)
+                            .and_then(|a| a.last())
+                            .and_then(|n| n.pointer("/node/String/sval"))
+                            .and_then(Value::as_str)
+                        {
+                            out.collations.push(n.to_string());
                         }
                     }
                     "LockingClause" => out.locking = true,
@@ -286,6 +359,74 @@ fn scan(v: &serde_json::Value, out: &mut Scan) {
         }
         Value::Array(items) => items.iter().for_each(|i| scan(i, out)),
         _ => {}
+    }
+}
+
+/// Functions over date/time values whose result, cast to a date/time type, cannot depend
+/// on the clock (given date/time or constant arguments).
+const DATETIME_FUNCS: &[&str] = &[
+    "date_trunc", "date_bin", "timezone", "make_date", "make_time", "make_timestamp", "make_timestamptz",
+    "to_timestamp", "date_add", "date_subtract", "make_interval",
+];
+
+/// Whether casting this expression to a date/time type is certain not to read the clock.
+/// Only parameters (checked at run time), constants (checked for time words), columns
+/// (recorded; the proxy confirms they are date/time columns), casts to date/time types,
+/// date/time functions and + / - of those qualify. Anything that could be text at run
+/// time -- a text column, `j->>'ts'`, string functions, CASE, ... -- does not.
+fn datetime_safe(v: &serde_json::Value, cols: &mut Vec<String>) -> bool {
+    use serde_json::Value;
+    let Some(map) = v.as_object() else { return false };
+    if let Some(inner) = map.get("node") {
+        return datetime_safe(inner, cols);
+    }
+    let Some((kind, val)) = map.iter().next().filter(|_| map.len() == 1) else { return false };
+    let names = |key: &str| -> Vec<String> {
+        val.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|n| n.pointer("/node/String/sval").and_then(Value::as_str)).map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    match kind.as_str() {
+        "ParamRef" | "AConst" => true,
+        "ColumnRef" => {
+            let fields = val.get("fields").and_then(Value::as_array);
+            match fields.and_then(|f| f.last()).and_then(|n| n.pointer("/node/String/sval")).and_then(Value::as_str) {
+                Some(c) => {
+                    cols.push(c.to_string());
+                    true
+                }
+                None => false, // t.*
+            }
+        }
+        "TypeCast" => {
+            let target = names("names");
+            let target = val
+                .pointer("/type_name/names")
+                .and_then(Value::as_array)
+                .and_then(|a| a.last())
+                .and_then(|n| n.pointer("/node/String/sval"))
+                .and_then(Value::as_str)
+                .or(target.last().map(String::as_str))
+                .unwrap_or("");
+            DATETIME_TYPES.contains(&target) && val.get("arg").is_some_and(|a| datetime_safe(a, cols))
+        }
+        "FuncCall" => {
+            let f = names("funcname");
+            let ok_name = match f.as_slice() {
+                [n] => DATETIME_FUNCS.contains(&n.as_str()),
+                [s, n] => s == "pg_catalog" && DATETIME_FUNCS.contains(&n.as_str()),
+                _ => false,
+            };
+            ok_name
+                && val.get("args").and_then(Value::as_array).is_none_or(|args| args.iter().all(|a| datetime_safe(a, cols)))
+        }
+        "AExpr" => {
+            let op = names("name");
+            matches!(op.as_slice(), [o] if o == "+" || o == "-")
+                && ["lexpr", "rexpr"].iter().all(|k| val.get(*k).is_none_or(|x| datetime_safe(x, cols)))
+        }
+        _ => false,
     }
 }
 
@@ -348,6 +489,10 @@ pub fn classify(sql: &str) -> Classified {
         Some("time function")
     } else if sc.time_literal {
         Some("time literal ('now', 'today', ...)")
+    } else if sc.clock_cast {
+        Some("run-time text cast to a date/time type")
+    } else if sc.reg_cast {
+        Some("cast to a catalog-name type (regclass, ...)")
     } else if sc.cross_db {
         Some("cross-database reference")
     } else if sc.funcs.iter().any(|f| !func_name_in(f, safe_functions())) {
@@ -373,7 +518,29 @@ pub fn classify(sql: &str) -> Classified {
     let mut seen = HashSet::new();
     rels.retain(|r| seen.insert(r.clone()));
 
-    Classified { cacheable: Some(Cacheable { relations: rels }), bypass_reason: "", effects, shape }
+    let mut functions: Vec<String> = sc.funcs.iter().filter_map(|f| f.last().cloned()).collect();
+    functions.sort();
+    functions.dedup();
+    // Comparisons are resolved by type even when written implicitly (IN, BETWEEN, CASE,
+    // joins with USING), so the common comparison operators are always included.
+    let mut operators: Vec<String> = sc.operators.clone();
+    operators.extend(["=", "<>", "<", ">", "<=", ">="].map(String::from));
+    operators.sort();
+    operators.dedup();
+    let mut types: Vec<String> = sc.cast_types.iter().filter_map(|t| t.last().cloned()).collect();
+    types.extend(sc.collations.iter().cloned());
+    types.sort();
+    types.dedup();
+    let mut clock_columns = sc.clock_columns.clone();
+    clock_columns.sort();
+    clock_columns.dedup();
+
+    Classified {
+        cacheable: Some(Cacheable { relations: rels, functions, operators, types, clock_columns }),
+        bypass_reason: "",
+        effects,
+        shape,
+    }
 }
 
 fn effect_of(node: Option<&NodeEnum>, sc: &Scan) -> Effect {
@@ -387,18 +554,17 @@ fn effect_of(node: Option<&NodeEnum>, sc: &Scan) -> Effect {
                 Effect::Other
             }
         }
-        NodeEnum::VariableShowStmt(_) => Effect::Read,
+        NodeEnum::VariableShowStmt(_) => Effect::Show,
         NodeEnum::TransactionStmt(t) => match TransactionStmtKind::try_from(t.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
                 Effect::Begin(isolation_option(&t.options))
             }
+            Ok(TransactionStmtKind::TransStmtCommit | TransactionStmtKind::TransStmtRollback) if !t.chain => Effect::TxnEnd,
             Ok(
-                TransactionStmtKind::TransStmtCommit
-                | TransactionStmtKind::TransStmtRollback
-                | TransactionStmtKind::TransStmtSavepoint
+                TransactionStmtKind::TransStmtSavepoint
                 | TransactionStmtKind::TransStmtRelease
                 | TransactionStmtKind::TransStmtRollbackTo,
-            ) if !t.chain => Effect::TxnControl,
+            ) => Effect::TxnControl,
             _ => Effect::Other,
         },
         NodeEnum::InsertStmt(_)
@@ -419,7 +585,7 @@ fn effect_of(node: Option<&NodeEnum>, sc: &Scan) -> Effect {
             }
         }
         NodeEnum::DiscardStmt(d) => match DiscardMode::try_from(d.target) {
-            Ok(DiscardMode::DiscardPlans | DiscardMode::DiscardSequences) => Effect::Other,
+            Ok(DiscardMode::DiscardPlans | DiscardMode::DiscardSequences | DiscardMode::DiscardTemp) => Effect::Other,
             _ => Effect::DiscardAll,
         },
         _ => Effect::Other,
@@ -451,32 +617,69 @@ fn shape_of(sql: &str) -> u64 {
     }
 }
 
-/// Bounded memo of classifications, keyed by the exact SQL text.
+/// Bounded memo of classifications.
+///
+/// Two levels: the exact SQL text (prepared and ORM queries repeat their text), and the
+/// statement's shape, for texts with inlined constants that never repeat exactly.
+/// A shape (pg_query's fingerprint) ignores constant values but keeps statement types,
+/// table, schema and function names, locking clauses, etc.; the only constant-dependent
+/// part of classifying a SELECT is a time literal ('now', ...), so the shape level is
+/// only used for SELECTs whose text contains none of those words anywhere.
 pub struct Classifier {
-    map: Mutex<std::collections::HashMap<u64, (Arc<str>, Arc<Classified>)>>,
+    exact: Mutex<std::collections::HashMap<u64, (Arc<str>, Arc<Classified>)>>,
+    shapes: Mutex<std::collections::HashMap<u64, Arc<Classified>>>,
     capacity: usize,
+}
+
+/// Whether the shape level may be used for this text: no time word anywhere (including
+/// identifiers and comments -- a false positive only means the slower path), and no
+/// escapes that could spell one (E'\x6eow', U&'\006eow').
+fn shape_level_ok(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    !TIME_WORDS.iter().any(|w| lower.contains(w)) && !lower.contains('\\') && !lower.contains("u&")
 }
 
 impl Classifier {
     pub fn new(capacity: usize) -> Self {
-        Self { map: Mutex::new(Default::default()), capacity }
+        Self { exact: Mutex::new(Default::default()), shapes: Mutex::new(Default::default()), capacity }
     }
 
     pub fn get(&self, sql: &str) -> Arc<Classified> {
         let h = xxhash_rust::xxh3::xxh3_64(sql.as_bytes());
-        if let Some((text, c)) = self.map.lock().get(&h) {
+        if let Some((text, c)) = self.exact.lock().get(&h) {
             if &**text == sql {
                 return c.clone();
             }
         }
-        let c = Arc::new(classify(sql)); // parse outside the lock
-        let mut m = self.map.lock();
+        let shape_ok = shape_level_ok(sql);
+        if shape_ok {
+            if let Ok(fp) = pg_query::fingerprint(sql) {
+                if let Some(c) = self.shapes.lock().get(&fp.value) {
+                    return c.clone();
+                }
+            }
+        }
+        let c = Arc::new(classify(sql)); // parse outside the locks
+        if shape_ok && c.effects == [Effect::Read] && sql.trim_start().len() > 6 && is_select(&c) {
+            let mut m = self.shapes.lock();
+            if m.len() >= self.capacity {
+                m.clear();
+            }
+            m.insert(c.shape, c.clone());
+        }
+        let mut m = self.exact.lock();
         if m.len() >= self.capacity {
             m.clear();
         }
         m.insert(h, (Arc::from(sql), c.clone()));
         c
     }
+}
+
+/// A single SELECT (cacheable or not, as long as it was classified as one).
+fn is_select(c: &Classified) -> bool {
+    c.cacheable.is_some() || c.bypass_reason != "not a SELECT" && c.bypass_reason != "multiple statements"
+        && c.bypass_reason != "parse error" && c.bypass_reason != "empty query"
 }
 
 #[cfg(test)]
@@ -545,9 +748,51 @@ mod tests {
             "SELECT a FROM t, LATERAL (SELECT now()) l",
             "SELECT a FROM t WHERE x = (WITH q AS (SELECT now()) SELECT * FROM q)",
             "SELECT a FROM db.s.t",
+            // clock-dependent literals found by review
+            "SELECT * FROM t WHERE ts > 'today 10:00'::timestamp",
+            "SELECT * FROM t WHERE ts > 'Yesterday 23:59'",
+            "SELECT * FROM t WHERE ts > E'\\x6eow'::timestamptz",
+            "SELECT * FROM t WHERE ts > U&'\\006Eow'::timestamptz",
+            "SELECT * FROM t WHERE ts > $$now$$::timestamptz",
+            "SELECT * FROM t WHERE ts > ('n' || 'ow')::timestamptz",
+            "SELECT * FROM t WHERE ts > concat(a, b)::date",
+            "SELECT (j->>'ts')::timestamptz FROM t",
+            "SELECT CASE WHEN a THEN b ELSE c END::date FROM t",
+            "SELECT t.*::timestamp FROM t",
+            "SELECT * FROM t WHERE ts > CAST(lower(a) AS timestamp)",
+            // catalog-dependent output
+            "SELECT 't'::regclass, a FROM t",
+            "SELECT a::regtype FROM t",
+            "SELECT pg_typeof(a) FROM t",
         ] {
             assert!(!cacheable(sql), "{sql} should not be cacheable");
         }
+    }
+
+    #[test]
+    fn date_casts_of_columns_and_constants_stay_cacheable() {
+        assert!(cacheable("SELECT created_at::date, count(*) FROM t GROUP BY 1"));
+        assert!(cacheable("SELECT * FROM t WHERE created_at > '2026-01-01'::timestamptz"));
+        assert!(cacheable("SELECT date_trunc('day', created_at)::date FROM t"));
+        assert!(cacheable("SELECT * FROM t WHERE created_at > $1::timestamptz"));
+    }
+
+    #[test]
+    fn date_cast_columns_are_reported() {
+        let c = classify("SELECT created_at::date, CAST(d AS timestamptz) + interval '1 day' FROM t").cacheable.unwrap();
+        assert_eq!(c.clock_columns, vec!["created_at", "d"]);
+        let c = classify("SELECT date_trunc('day', t.ts)::date FROM t ORDER BY v COLLATE \"C\"").cacheable.unwrap();
+        assert_eq!(c.clock_columns, vec!["ts"]);
+        assert!(c.types.contains(&"C".to_string()));
+    }
+
+    #[test]
+    fn names_for_the_shadowing_check() {
+        let c = classify("SELECT lower(a), a::int4 FROM t WHERE b ~~ 'x%' AND c @> $1").cacheable.unwrap();
+        assert_eq!(c.functions, vec!["lower"]);
+        assert!(c.operators.contains(&"~~".to_string()) && c.operators.contains(&"@>".to_string()));
+        assert!(c.operators.contains(&"=".to_string()));
+        assert_eq!(c.types, vec!["int4"]);
     }
 
     #[test]
@@ -576,6 +821,32 @@ mod tests {
     }
 
     #[test]
+    fn shape_memo_agrees_with_full_classification() {
+        let c = Classifier::new(1000);
+        // Same shape, different constants -> shape memo.
+        let a = c.get("SELECT * FROM orders WHERE id = 5");
+        let b = c.get("SELECT * FROM orders WHERE id = 99");
+        assert!(a.cacheable.is_some() && b.cacheable.is_some());
+        // A time literal in an otherwise identical shape must not reuse it.
+        let n = c.get("SELECT * FROM orders WHERE id = 5 AND d < 'now'");
+        assert!(n.cacheable.is_none());
+        let n = c.get("SELECT * FROM orders WHERE d < 'Today'::date");
+        assert!(n.cacheable.is_none());
+        // Escapes that decode to a time word must not reuse the shape either.
+        c.get("SELECT * FROM orders WHERE d < '2024-01-01'::timestamptz");
+        assert!(c.get("SELECT * FROM orders WHERE d < E'\\x6eow'::timestamptz").cacheable.is_none());
+        // Different functions are different shapes.
+        c.get("SELECT lower(name) FROM orders WHERE id = 1");
+        assert!(c.get("SELECT random() FROM orders WHERE id = 1").cacheable.is_none());
+        assert!(c.get("SELECT * FROM orders WHERE id = 1 FOR UPDATE").cacheable.is_none());
+        for sql in ["UPDATE orders SET a = 1 WHERE id = 2", "UPDATE orders SET a = 1 WHERE id = 3"] {
+            assert_eq!(c.get(sql).effects, vec![Effect::Write]);
+        }
+        assert_eq!(c.get("BEGIN ISOLATION LEVEL SERIALIZABLE").effects, vec![Effect::Begin(Some(Isolation::Serializable))]);
+        assert_eq!(c.get("BEGIN ISOLATION LEVEL READ COMMITTED").effects, vec![Effect::Begin(Some(Isolation::ReadCommitted))]);
+    }
+
+    #[test]
     fn effects() {
         assert_eq!(classify("BEGIN").effects, vec![Effect::Begin(None)]);
         assert_eq!(
@@ -586,13 +857,15 @@ mod tests {
             classify("START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY").effects,
             vec![Effect::Begin(Some(Isolation::Serializable))]
         );
-        assert_eq!(classify("COMMIT").effects, vec![Effect::TxnControl]);
+        assert_eq!(classify("COMMIT").effects, vec![Effect::TxnEnd]);
+        assert_eq!(classify("ROLLBACK").effects, vec![Effect::TxnEnd]);
         assert_eq!(classify("COMMIT AND CHAIN").effects, vec![Effect::Other]);
         assert_eq!(classify("SAVEPOINT a").effects, vec![Effect::TxnControl]);
         assert_eq!(classify("UPDATE t SET a = 1").effects, vec![Effect::Write]);
         assert_eq!(classify("UPDATE t SET a = set_config('x','y',false)").effects, vec![Effect::Other]);
         assert_eq!(classify("SET search_path = x").effects, vec![Effect::Other]);
-        assert_eq!(classify("SHOW search_path").effects, vec![Effect::Read]);
+        assert_eq!(classify("SHOW search_path").effects, vec![Effect::Show]);
+        assert_eq!(classify("DISCARD TEMP").effects, vec![Effect::Other]);
         assert_eq!(classify("SELECT set_config('a','b',false)").effects, vec![Effect::Other]);
         assert_eq!(classify("SELECT now()").effects, vec![Effect::Read]);
         assert_eq!(classify("SELECT nextval('s')").effects, vec![Effect::Other]);

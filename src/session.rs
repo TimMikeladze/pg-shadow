@@ -2,25 +2,25 @@
 //!
 //! Each client session is paired with its own upstream Postgres session (like
 //! PgBouncer's session mode), so transactions, prepared statements, temp tables, LISTEN,
-//! COPY and session settings behave exactly as without the proxy. Three tasks:
+//! COPY and session settings behave exactly as without the proxy. Two tasks:
 //!
 //! - the client reader (this module's main loop) decides, per request, whether to
 //!   serve it from cache, fill the cache from it, or just forward it;
 //! - the upstream reader routes Postgres's responses: to the client, into a capture
-//!   buffer for the cache, or to the proxy itself for queries it injected;
-//! - the client writer emits responses strictly in request order.
+//!   buffer for the cache, or to the proxy itself for queries it injected.
 //!
 //! Responses from Postgres are split into "units", each ending with ReadyForQuery.
 //! A request is only considered for the cache when no earlier unit is still in flight,
-//! so served results always reflect the client's own earlier statements, and statements
-//! are never reordered.
+//! so served results always reflect the client's own earlier statements, statements are
+//! never reordered, and the only writer to the client at that moment is the client
+//! reader itself (the upstream reader writes everything else, in arrival order).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -195,6 +195,18 @@ impl Shared {
 struct StmtInfo {
     sql: Arc<str>,
     param_oids: Arc<[u32]>,
+    /// State of the statement's tables when it was prepared (None: unknown). A later
+    /// Bind-only request may only be answered with a result read from tables in exactly
+    /// this state: otherwise Postgres would re-plan it or refuse ("cached plan must not
+    /// change result type"), and the client's idea of the row shape could be wrong.
+    deps: Option<Arc<Vec<(u32, String)>>>,
+}
+
+fn dep_set(tables: &[TableDep]) -> Arc<Vec<(u32, String)>> {
+    let mut v: Vec<(u32, String)> = tables.iter().map(|t| (t.oid, t.fp.clone())).collect();
+    v.sort();
+    v.dedup();
+    Arc::new(v)
 }
 
 /// What this session's settings look like, as far as results are concerned.
@@ -202,10 +214,16 @@ struct StmtInfo {
 struct SessionFp {
     hash: u128,
     current_user: String,
-    /// current_schemas(true), comma-separated.
-    schemas: String,
+    database: String,
+    /// The search_path setting as the session has it.
+    path: String,
     temp_rels: i64,
     default_iso: Option<Isolation>,
+    /// Postmaster start time: which server the session is on.
+    server: String,
+    in_recovery: bool,
+    /// Server settings generation (Validator::settings_generation) when this was read.
+    gen: u64,
 }
 
 struct State {
@@ -221,6 +239,8 @@ struct State {
     /// Settings may have changed since `fp` was read.
     fp_stale: bool,
     fp_refreshing: bool,
+    /// Settings generation when the pending refresh was sent.
+    fp_refresh_gen: u64,
     /// Prepared statements Postgres has confirmed.
     statements: HashMap<String, StmtInfo>,
 }
@@ -229,8 +249,13 @@ struct State {
 #[derive(Default, Clone, Debug)]
 struct UnitEffects {
     writes: bool,
-    /// BEGIN seen: explicit isolation level, or None for the session default.
+    /// Last BEGIN seen: explicit isolation level, or None for the session default.
     begin: Option<Option<Isolation>>,
+    /// COMMIT or ROLLBACK seen.
+    txn_end: bool,
+    /// Ran something that could have run user code (a view, trigger, function, operator):
+    /// the session's settings must be read again before the cache is used.
+    dirty: bool,
     settings: bool,
     parsed: Vec<(String, StmtInfo)>,
 }
@@ -240,12 +265,18 @@ impl UnitEffects {
         let mut fx = UnitEffects::default();
         for e in effects {
             match e {
-                Effect::Read | Effect::TxnControl | Effect::Deallocate(_) => {}
+                Effect::Show | Effect::TxnControl | Effect::Deallocate(_) => {}
+                Effect::Read => fx.dirty = true,
+                Effect::TxnEnd => fx.txn_end = true,
                 Effect::Begin(iso) => fx.begin = Some(*iso),
-                Effect::Write => fx.writes = true,
+                Effect::Write => {
+                    fx.writes = true;
+                    fx.dirty = true;
+                }
                 Effect::DiscardAll | Effect::Other => {
                     fx.writes = true;
                     fx.settings = true;
+                    fx.dirty = true;
                 }
             }
         }
@@ -254,12 +285,14 @@ impl UnitEffects {
 
     /// For units whose contents the proxy cannot fully see.
     fn unknown() -> Self {
-        UnitEffects { writes: true, begin: None, settings: true, parsed: vec![] }
+        UnitEffects { writes: true, begin: None, txn_end: true, settings: true, dirty: true, parsed: vec![] }
     }
 
     fn merge(&mut self, o: UnitEffects) {
         self.writes |= o.writes;
         self.settings |= o.settings;
+        self.txn_end |= o.txn_end;
+        self.dirty |= o.dirty;
         if o.begin.is_some() {
             self.begin = o.begin;
         }
@@ -301,7 +334,8 @@ enum SwallowKind {
 
 enum Up {
     Forward {
-        out: mpsc::Sender<Bytes>,
+        /// Sent to the client ahead of the unit's responses.
+        prefix: Bytes,
         fx: UnitEffects,
         capture: Option<Capture>,
         done: Option<oneshot::Sender<Done>>,
@@ -316,9 +350,12 @@ enum Up {
     },
 }
 
-enum Out {
-    Stream { prefix: Bytes, rx: mpsc::Receiver<Bytes> },
-    Local(Bytes),
+type ClientW = Arc<tokio::sync::Mutex<WriteHalf<Stream>>>;
+
+async fn write_client(w: &ClientW, b: &[u8]) -> std::io::Result<()> {
+    let mut w = w.lock().await;
+    w.write_all(b).await?;
+    w.flush().await
 }
 
 // ---- requests ------------------------------------------------------------------
@@ -327,6 +364,8 @@ enum Req {
     Simple {
         frame: Frame,
         sql: String,
+        /// The session had an unnamed prepared statement, which this query destroys.
+        drops_unnamed: bool,
     },
     Extended {
         /// The whole batch, ending with Sync.
@@ -406,21 +445,34 @@ impl Req {
     }
 
     fn parsed(&self) -> Vec<(String, StmtInfo)> {
+        self.parsed_with(None)
+    }
+
+    fn parsed_with(&self, deps: Option<Arc<Vec<(u32, String)>>>) -> Vec<(String, StmtInfo)> {
         match self {
             Req::Extended { parse_idx: Some(_), stmt, bind, .. } => {
-                vec![(bind.statement_name.clone().unwrap_or_default(), stmt.clone())]
+                let mut info = stmt.clone();
+                info.deps = deps;
+                vec![(bind.statement_name.clone().unwrap_or_default(), info)]
             }
             _ => vec![],
         }
     }
 
-    /// Parameters that Postgres would turn into the current time ('now', 'today', ...).
-    /// Checked in every format: the binary form of a text value is the same bytes.
+    /// For a Bind of a statement prepared earlier: its tables' state when prepared.
+    fn prepared_deps(&self) -> Option<Option<&Arc<Vec<(u32, String)>>>> {
+        match self {
+            Req::Extended { parse_idx: None, stmt, .. } => Some(stmt.deps.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Parameters that Postgres could turn into the current time ('now', 'today 10:00',
+    /// ...). Checked in every format and at any length: the binary form of a text value is
+    /// the same bytes, and a false positive only means a cache bypass.
     fn has_time_param(&self) -> bool {
         let Req::Extended { bind, .. } = self else { return false };
-        bind.parameters.iter().any(|p| {
-            p.as_ref().is_some_and(|v| v.len() <= 16 && crate::classify::is_time_word(&String::from_utf8_lossy(v)))
-        })
+        bind.parameters.iter().any(|p| p.as_ref().is_some_and(|v| crate::classify::is_time_word(&String::from_utf8_lossy(v))))
     }
 }
 
@@ -434,22 +486,34 @@ fn put_bytes(b: &mut Vec<u8>, v: &[u8]) {
 const OUR_STMT: &str = "__pgshadow_q";
 const OUR_PORTAL: &str = "__pgshadow_p";
 
-const FP_SQL: &str = "SELECT current_user::text, session_user::text, pg_catalog.current_database()::text, \
-     pg_catalog.array_to_string(pg_catalog.current_schemas(true), ','), \
-     (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
-       WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema())::text, \
+/// The session's identity and the settings that affect results (hashed: columns 0-6),
+/// then facts about its server and transaction (not hashed: 7-10).
+const FP_SQL: &str = "SELECT current_user::pg_catalog.text, session_user::pg_catalog.text, \
+     pg_catalog.current_database()::pg_catalog.text, pg_catalog.current_setting('search_path'), \
+     CASE WHEN pg_catalog.pg_my_temp_schema() OPERATOR(pg_catalog.=) 0 THEN '0' \
+          ELSE (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
+                WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema())::pg_catalog.text END, \
      pg_catalog.current_setting('default_transaction_isolation'), \
-     (SELECT pg_catalog.string_agg(s.name OPERATOR(pg_catalog.||) '=' OPERATOR(pg_catalog.||) s.setting, \
-             pg_catalog.chr(10) ORDER BY s.name) \
-        FROM pg_catalog.pg_settings s \
-       WHERE s.source NOT IN ('default', 'override') \
-         AND s.name NOT IN ('application_name', 'statement_timeout', 'lock_timeout', \
-             'idle_in_transaction_session_timeout', 'idle_session_timeout', 'transaction_timeout', \
-             'client_min_messages', 'work_mem', 'maintenance_work_mem', 'temp_buffers', \
-             'default_transaction_read_only', 'transaction_read_only', 'tcp_keepalives_idle', \
-             'tcp_keepalives_interval', 'tcp_keepalives_count', 'tcp_user_timeout'))";
+     pg_catalog.md5(pg_catalog.concat_ws(',', pg_catalog.current_setting('bytea_output'), \
+       pg_catalog.current_setting('extra_float_digits'), pg_catalog.current_setting('lc_monetary'), \
+       pg_catalog.current_setting('lc_numeric'), pg_catalog.current_setting('lc_time'), \
+       pg_catalog.current_setting('xmloption'), pg_catalog.current_setting('xmlbinary'), \
+       pg_catalog.current_setting('IntervalStyle'), pg_catalog.current_setting('DateStyle'), \
+       pg_catalog.current_setting('TimeZone'), pg_catalog.current_setting('timezone_abbreviations'), \
+       pg_catalog.current_setting('standard_conforming_strings'), pg_catalog.current_setting('backslash_quote'), \
+       pg_catalog.current_setting('escape_string_warning'), pg_catalog.current_setting('default_text_search_config'), \
+       pg_catalog.current_setting('array_nulls'), pg_catalog.current_setting('quote_all_identifiers'), \
+       pg_catalog.current_setting('transform_null_equals'), pg_catalog.current_setting('gin_fuzzy_search_limit'), \
+       pg_catalog.current_setting('client_encoding'), pg_catalog.current_setting('lc_messages'))), \
+     EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text, \
+     pg_catalog.pg_is_in_recovery()::pg_catalog.text, \
+     (pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL)::pg_catalog.text, \
+     pg_catalog.current_setting('transaction_isolation')";
 
-const PREP_SQL: &str = "SELECT snap, ord, rel, eligible, fp, reason FROM pgshadow.prep($1::text[], $2::text[])";
+/// Inside a transaction: its isolation level, and whether it has written anything (by
+/// any route: a trigger, a function, a view calling one).
+const TXN_SQL: &str = "SELECT (pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL)::pg_catalog.text, \
+     pg_catalog.current_setting('transaction_isolation')";
 
 /// Extended-protocol messages running one of the proxy's own queries on the client's
 /// session, without touching the client's unnamed statement or portal.
@@ -475,6 +539,9 @@ fn parse_fp(frames: &[Frame]) -> Option<SessionFp> {
     let rows = rows_of(frames)?;
     let r = rows.first()?;
     let col = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+    if r.len() < 11 {
+        return None;
+    }
     let mut all = String::new();
     for i in 0..7 {
         all.push_str(&col(i));
@@ -483,10 +550,23 @@ fn parse_fp(frames: &[Frame]) -> Option<SessionFp> {
     Some(SessionFp {
         hash: xxhash_rust::xxh3::xxh3_128(all.as_bytes()),
         current_user: col(0),
-        schemas: col(3),
+        database: col(2),
+        path: col(3),
         temp_rels: col(4).parse().unwrap_or(1),
         default_iso: Isolation::parse(&col(5)),
+        server: col(7),
+        in_recovery: col(8) != "false",
+        gen: 0,
     })
+}
+
+/// (isolation level, has written) from a TXN_SQL result, or from FP_SQL's last columns.
+fn parse_txn(frames: &[Frame], first: usize) -> Option<(Option<Isolation>, bool)> {
+    let rows = rows_of(frames)?;
+    let r = rows.first()?;
+    let iso = Isolation::parse(r.get(first + 1)?.as_deref()?);
+    let wrote = r.get(first)?.as_deref()? != "false";
+    Some((iso, wrote))
 }
 
 pub struct Session {
@@ -496,7 +576,7 @@ pub struct Session {
     idle: Arc<tokio::sync::Notify>,
     up_w: WriteHalf<Stream>,
     up_units: mpsc::UnboundedSender<Up>,
-    out: mpsc::UnboundedSender<Out>,
+    client_w: ClientW,
     /// A forwarded batch is open: its Sync has not been sent yet.
     open_forward: bool,
     conn: u64,
@@ -519,26 +599,26 @@ pub async fn run(
         fp: None,
         fp_stale: true,
         fp_refreshing: false,
+        fp_refresh_gen: 0,
         statements: HashMap::new(),
     }));
-    let (out_tx, out_rx) = mpsc::unbounded_channel();
-    let (async_tx, async_rx) = mpsc::unbounded_channel();
+    let client_w: ClientW = Arc::new(tokio::sync::Mutex::new(client_w));
     let (up_tx, up_rx) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(client_writer(client_w, out_rx, async_rx));
     let (closed_tx, mut closed_rx) = watch::channel(false);
     let idle = Arc::new(tokio::sync::Notify::new());
     let reader = tokio::spawn({
         let st = st.clone();
         let sh = sh.clone();
         let idle = idle.clone();
+        let client_w = client_w.clone();
         async move {
-            if let Err(e) = upstream_reader(upstream_rd, up_rx, async_tx, st, sh, idle).await {
+            if let Err(e) = upstream_reader(upstream_rd, up_rx, client_w, st, sh, idle).await {
                 tracing::debug!(conn, error = %e, "upstream read ended");
             }
             let _ = closed_tx.send(true);
         }
     });
-    let mut s = Session { sh, st, idle, up_w, up_units: up_tx, out: out_tx, open_forward: false, conn };
+    let mut s = Session { sh, st, idle, up_w, up_units: up_tx, client_w: client_w.clone(), open_forward: false, conn };
     let mut rd = client_rd;
     let result = async {
         // Read the session's settings right away, so the first query can use the cache.
@@ -562,7 +642,7 @@ pub async fn run(
     let _ = s.up_w.shutdown().await;
     drop(s);
     let _ = reader.await;
-    let _ = writer.await;
+    let _ = client_w.lock().await.shutdown().await;
 }
 
 impl Session {
@@ -649,17 +729,7 @@ impl Session {
         prefix: Bytes,
     ) -> std::io::Result<()> {
         if !self.open_forward {
-            let (tx, rx) = mpsc::channel(128);
-            let idle = self.st.lock().pending == 0;
-            let _ = self.out.send(Out::Stream { prefix, rx });
-            self.push_unit(Up::Forward {
-                out: tx,
-                fx,
-                capture,
-                done,
-                started: Instant::now(),
-                timing_key: if idle { timing_key } else { None },
-            });
+            self.push_unit(Up::Forward { prefix, fx, capture, done, started: Instant::now(), timing_key });
         }
         self.open_forward = !ends_unit;
         self.write_up(&frames).await
@@ -673,8 +743,9 @@ impl Session {
         Ok(rx)
     }
 
-    fn local(&self, bytes: Bytes) {
-        let _ = self.out.send(Out::Local(bytes));
+    /// A response the proxy produces itself. Only called with nothing in flight upstream.
+    async fn local(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        write_client(&self.client_w, bytes).await
     }
 
     fn apply_immediate(&mut self, effects: &[Effect]) {
@@ -701,17 +772,18 @@ impl Session {
     }
 
     /// Re-read the session's settings when they may have changed. Sent ahead of the
-    /// client's next request (never inside a transaction), and not waited for.
+    /// client's next request (not inside a failed transaction), and not waited for.
     async fn refresh_fingerprint_if_needed(&mut self) -> std::io::Result<()> {
         if !self.sh.enabled() || !self.sh.validator.installed() || self.open_forward {
             return Ok(());
         }
         {
             let mut st = self.st.lock();
-            if !(st.fp_stale && !st.fp_refreshing && st.status == b'I' && st.pending == 0) {
+            if !(st.fp_stale && !st.fp_refreshing && matches!(st.status, b'I' | b'T') && st.pending == 0) {
                 return Ok(());
             }
             st.fp_refreshing = true;
+            st.fp_refresh_gen = self.sh.validator.settings_generation();
         }
         self.push_unit(Up::Swallow { fx: UnitEffects::default(), frames: Vec::new(), kind: SwallowKind::Fingerprint });
         self.write_up(&our_query(FP_SQL, &[])).await
@@ -726,8 +798,10 @@ impl Session {
         };
         let cls = self.sh.classifier.get(&q.query);
         self.apply_immediate(&cls.effects);
+        // A simple query destroys the unnamed prepared statement.
+        let drops_unnamed = self.st.lock().statements.remove("").is_some();
         if cls.cacheable.is_some() {
-            let req = Req::Simple { frame, sql: q.query };
+            let req = Req::Simple { frame, sql: q.query, drops_unnamed };
             return self.try_cache(req, cls).await;
         }
         self.bypass(&cls, cls.bypass_reason_or_effect());
@@ -760,11 +834,22 @@ impl Session {
     async fn forward_batch(&mut self, frames: Vec<Frame>, ends: bool) -> std::io::Result<()> {
         let mut fx = if ends { UnitEffects::default() } else { UnitEffects::unknown() };
         let mut local: HashMap<String, StmtInfo> = HashMap::new();
+        // The last-read settings are good enough even if stale: the recorded state names
+        // exact tables, so a different resolution can only cause a mismatch (no hit). Right
+        // after connecting they may not have been read yet: wait for that.
+        let mut fp = self.st.lock().fp.clone();
+        if fp.is_none() && self.st.lock().fp_refreshing && !self.open_forward && self.sh.enabled() {
+            self.wait_idle().await;
+            fp = self.st.lock().fp.clone();
+        }
         for f in &frames {
             match f.tag {
                 b'P' => match f.decode::<protocol::Parse>() {
                     Some(p) => {
-                        let info = StmtInfo { sql: Arc::from(p.query.as_str()), param_oids: Arc::from(p.type_oids.as_slice()) };
+                        // Statements prepared now and bound later: remember their tables'
+                        // state (read before the Parse reaches Postgres: conservative).
+                        let deps = prepared_deps(&self.sh, fp.clone(), &p.query).await;
+                        let info = StmtInfo { sql: Arc::from(p.query.as_str()), param_oids: Arc::from(p.type_oids.as_slice()), deps };
                         let name = p.name.unwrap_or_default();
                         local.insert(name.clone(), info.clone());
                         fx.parsed.push((name, info));
@@ -824,7 +909,7 @@ impl Session {
                 if pname != stmt_name || (!pname.is_empty() && self.st.lock().statements.contains_key(&pname)) {
                     return None;
                 }
-                StmtInfo { sql: Arc::from(p.query.as_str()), param_oids: Arc::from(p.type_oids.as_slice()) }
+                StmtInfo { sql: Arc::from(p.query.as_str()), param_oids: Arc::from(p.type_oids.as_slice()), deps: None }
             }
             None => self.st.lock().statements.get(&stmt_name)?.clone(),
         };
@@ -861,9 +946,22 @@ impl Session {
             (Some(fp), false) => fp.clone(),
             _ => return Err("session settings changed"),
         };
+        drop(st);
+        if fp.gen != self.sh.validator.settings_generation() {
+            self.st.lock().fp_stale = true;
+            return Err("server settings changed");
+        }
+        if fp.in_recovery {
+            return Err("server is a standby");
+        }
+        if !self.sh.validator.same_server(&fp.database, &fp.server) {
+            return Err("not the server and database pgshadow checks");
+        }
+        let st = self.st.lock();
         if fp.temp_rels > 0 {
             return Err("session has temporary tables");
         }
+
         match st.status {
             b'I' => {
                 if !fp.default_iso.is_some_and(Isolation::is_read_committed) {
@@ -890,17 +988,7 @@ impl Session {
         // must finish first: their effects have to be visible to the check, and Postgres
         // would run them first anyway. Wait for them instead of skipping the cache.
         if !self.open_forward && self.sh.enabled() {
-            let idle = self.idle.clone();
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let notified = idle.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if self.st.lock().pending == 0 || Instant::now() >= deadline {
-                    break;
-                }
-                let _ = tokio::time::timeout_at(deadline.into(), notified).await;
-            }
+            self.wait_idle().await;
         }
         let read_fx = || {
             let mut fx = UnitEffects::from_effects(&cls.effects);
@@ -935,13 +1023,21 @@ impl Session {
         loop {
             if let Some(handle) = self.sh.store.get(key, &request).await {
                 let entry = Arc::new(handle.value().clone());
-                if self.sh.rel_disabled(entry.tables.iter().map(|t| t.oid)) {
-                    self.bypass(&cls, "table disabled after verification mismatch");
+                let blocked = if self.sh.rel_disabled(entry.tables.iter().map(|t| t.oid)) {
+                    Some("table disabled after verification mismatch")
+                } else if req.prepared_deps().is_some_and(|d| d != Some(&dep_set(&entry.tables))) {
+                    Some("statement was prepared before its tables last changed")
+                } else {
+                    None
+                };
+                if let Some(reason) = blocked {
+                    self.bypass(&cls, reason);
                     let fx = read_fx();
                     return self.forward(req.frames(false), true, fx, None, None, Some(cls.shape), Bytes::new()).await;
                 }
                 // The client's Parse (if any) runs on Postgres alongside the check, so the
-                // session's prepared statements stay exactly as without the proxy.
+                // session's prepared statements stay exactly as without the proxy. A simple
+                // query would have destroyed the unnamed statement: do that too.
                 let parse_rx = match req.parse_frame() {
                     Some(p) => {
                         let fx = UnitEffects { parsed: req.parsed(), ..Default::default() };
@@ -949,12 +1045,34 @@ impl Session {
                     }
                     None => None,
                 };
-                let verdict = self.sh.validator.check(entry.clone()).await;
+                if matches!(req, Req::Simple { drops_unnamed: true, .. }) {
+                    let _ = self.swallow(vec![protocol::close_msg(b'S', ""), protocol::sync_msg()], UnitEffects::default()).await?;
+                }
+                // Inside a transaction, the query would have locked its tables until the
+                // transaction ends (blocking concurrent DDL and TRUNCATE): take the same
+                // locks, before the check, so the check also sees anything committed first.
+                // Then confirm the transaction has not written (by any route) and is READ
+                // COMMITTED, so it sees exactly what the check sees.
+                let (lock_rx, txn_rx) = if self.st.lock().status == b'T' {
+                    let l = self.swallow(our_query(&lock_sql(&entry.tables), &[]), UnitEffects::default()).await?;
+                    let t = self.swallow(our_query(TXN_SQL, &[]), UnitEffects::default()).await?;
+                    (Some(l), Some(t))
+                } else {
+                    (None, None)
+                };
                 let parse_ok = match parse_rx {
                     Some(rx) => {
                         let frames = rx.await.unwrap_or_default();
                         if frames.iter().any(|f| f.tag == b'E') || frames.is_empty() {
-                            // Postgres rejected the Parse: give the client exactly that.
+                            // Postgres rejected the Parse: give the client exactly that. (In a
+                            // transaction the lock then ran in an aborted transaction and
+                            // failed too, which is what the client's Bind would have hit.)
+                            if let Some(rx) = lock_rx {
+                                let _ = rx.await;
+                            }
+                            if let Some(rx) = txn_rx {
+                                let _ = rx.await;
+                            }
                             let mut b = BytesMut::new();
                             for f in &frames {
                                 f.encode_into(&mut b);
@@ -962,14 +1080,64 @@ impl Session {
                             if frames.last().map(|f| f.tag) != Some(b'Z') {
                                 protocol::ready_for_query(self.st.lock().status).encode_into(&mut b);
                             }
-                            self.local(b.freeze());
-                            return Ok(());
+                            return self.local(&b).await;
                         }
                         Some(true)
                     }
                     None => None,
                 };
                 let parse_sent = parse_ok.is_some();
+                if let (Some(lrx), Some(trx)) = (lock_rx, txn_rx) {
+                    let frames = lrx.await.unwrap_or_default();
+                    let txn = trx.await.ok().and_then(|f| parse_txn(&f, 0));
+                    if let Some(err) = frames.iter().find(|f| f.tag == b'E') {
+                        // Canceled or timed out while waiting for the lock: exactly what the
+                        // client's query would have run into.
+                        let mut b = BytesMut::new();
+                        if parse_sent {
+                            Frame::new(b'1', Bytes::new()).encode_into(&mut b);
+                        }
+                        without_context(err).encode_into(&mut b);
+                        protocol::ready_for_query(self.st.lock().status).encode_into(&mut b);
+                        return self.local(&b).await;
+                    }
+                    if frames.is_empty() || frames.iter().any(|f| f.tag == b'N' && notice_is(f, LOCK_FAILED)) {
+                        // Any other problem (table gone, no privilege, deadlock): let Postgres
+                        // run the query and report it.
+                        return self.forward_instead(req, &cls, parse_sent, "could not lock tables").await;
+                    }
+                    let ok = match txn {
+                        Some((iso, wrote)) => {
+                            let mut st = self.st.lock();
+                            st.iso = iso;
+                            st.wrote |= wrote;
+                            !wrote && iso.is_some_and(Isolation::is_read_committed)
+                        }
+                        None => false,
+                    };
+                    if !ok {
+                        return self.forward_instead(req, &cls, parse_sent, "transaction has written or is not READ COMMITTED").await;
+                    }
+                }
+                let verdict = self.sh.validator.check(entry.clone()).await;
+                if verdict == Verdict::Valid && fp.gen != self.sh.validator.settings_generation() {
+                    // The server's configuration changed (seen by this check): this
+                    // session's settings must be read again first.
+                    self.st.lock().fp_stale = true;
+                    return self.forward_instead(req, &cls, parse_sent, "server settings changed").await;
+                }
+                if let Verdict::Invalid { meta: true } = verdict {
+                    self.st.lock().fp_stale = true;
+                }
+                if matches!(verdict, Verdict::Valid) && parse_sent {
+                    // The statement just prepared reads tables in the validated state.
+                    if let Req::Extended { bind, .. } = &req {
+                        let name = bind.statement_name.clone().unwrap_or_default();
+                        if let Some(info) = self.st.lock().statements.get_mut(&name) {
+                            info.deps = Some(dep_set(&entry.tables));
+                        }
+                    }
+                }
                 match verdict {
                     Verdict::Valid => {
                         self.sh.record_check(cls.shape, true);
@@ -981,7 +1149,7 @@ impl Session {
                         let mut b = BytesMut::with_capacity(entry.response.len() + 6);
                         b.extend_from_slice(&entry.response);
                         protocol::ready_for_query(status).encode_into(&mut b);
-                        self.local(b.freeze());
+                        self.local(&b).await?;
                         let stats = &self.sh.stats;
                         Stats::inc(&stats.hits);
                         stats.hit_bytes.fetch_add(entry.response.len() as u64, Ordering::Relaxed);
@@ -991,10 +1159,14 @@ impl Session {
                             postgres_micros = entry.exec_micros, bytes = entry.response.len());
                         return Ok(());
                     }
-                    Verdict::Invalid => {
+                    Verdict::Invalid { meta } => {
                         Stats::inc(&self.sh.stats.invalidated);
                         self.sh.record_check(cls.shape, false);
                         self.sh.store.remove(key);
+                        if meta {
+                            // A table changed (not just its data): re-read table state.
+                            self.sh.validator.forget_table_states();
+                        }
                     }
                     Verdict::Failed => Stats::inc(&self.sh.stats.check_failed),
                 }
@@ -1021,6 +1193,36 @@ impl Session {
         self.fill(req, cls, fp, key, request, None, false, None).await
     }
 
+    /// Wait (bounded) until no upstream unit is in flight.
+    fn wait_idle(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (idle, st) = (self.idle.clone(), self.st.clone());
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let notified = idle.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if st.lock().pending == 0 || Instant::now() >= deadline {
+                    break;
+                }
+                let _ = tokio::time::timeout_at(deadline.into(), notified).await;
+            }
+        }
+    }
+
+    /// Let Postgres answer after all (the client's Parse, if `parse_sent`, already ran).
+    async fn forward_instead(&mut self, req: Req, cls: &Classified, parse_sent: bool, reason: &'static str) -> std::io::Result<()> {
+        self.bypass(cls, reason);
+        let mut fx = UnitEffects::from_effects(&cls.effects);
+        let prefix = if parse_sent {
+            parse_complete()
+        } else {
+            fx.parsed = req.parsed();
+            Bytes::new()
+        };
+        self.forward(req.frames(parse_sent), true, fx, None, None, Some(cls.shape), prefix).await
+    }
+
     /// Run the request on Postgres, stream the result to the client, and store it.
     /// With `compare`, the fresh result is compared against a cached one instead.
     #[allow(clippy::too_many_arguments)]
@@ -1035,39 +1237,117 @@ impl Session {
         parse_sent: bool,
         guard: Option<InflightGuard>,
     ) -> std::io::Result<()> {
-        let rels: Vec<RelName> = cls.cacheable.as_ref().map(|c| c.relations.clone()).unwrap_or_default();
-        let schemas: Vec<Option<&str>> = rels.iter().map(|r| r.schema.as_deref()).collect();
-        let names: Vec<Option<&str>> = rels.iter().map(|r| Some(r.name.as_str())).collect();
-        let a1 = protocol::text_array(&schemas);
-        let a2 = protocol::text_array(&names);
-        let prep_rx = self.swallow(our_query(PREP_SQL, &[Some(&a1), Some(&a2)]), UnitEffects::default()).await?;
-
         // If the Parse already ran (hit path that fell through), send the rest and put
         // ParseComplete back in front, so the client and the cached bytes see exactly
         // what Postgres would have sent for the whole batch.
-        let prefix = if parse_sent {
-            let mut b = BytesMut::new();
-            Frame::new(b'1', Bytes::new()).encode_into(&mut b);
-            b.freeze()
-        } else {
-            Bytes::new()
+        let prefix = if parse_sent { parse_complete() } else { Bytes::new() };
+        let mut fx = UnitEffects::from_effects(&cls.effects);
+
+        // 1. State of every table the query names, read before the query runs (from the
+        //    proxy's own connection, briefly cached). Anything that changes afterwards
+        //    changes the fingerprint and fails validation, so earlier is conservative.
+        let rels: Vec<RelName> = cls.cacheable.as_ref().map(|c| c.relations.clone()).unwrap_or_default();
+        let lookup: Vec<(Option<String>, String)> = rels.iter().map(|r| (r.schema.clone(), r.name.clone())).collect();
+        let deps = match self.sh.validator.table_states(&fp.path, &fp.current_user, &lookup).await {
+            Some(states) => table_deps(&rels, &states),
+            None => Err("could not read table state"),
         };
+        let deps = match deps {
+            Ok(d) if self.sh.rel_disabled(d.iter().map(|t| t.oid)) => Err("table disabled after verification mismatch"),
+            Ok(d) if req.prepared_deps().is_some_and(|p| p != Some(&dep_set(&d))) => {
+                Err("statement was prepared before its tables last changed")
+            }
+            other => other,
+        };
+        let c = cls.cacheable.as_ref().expect("cacheable");
+        let deps = match deps {
+            Ok(d) if !c.clock_columns.is_empty() => {
+                let oids: Vec<u32> = d.iter().map(|t| t.oid).collect();
+                match self.sh.validator.clock_columns(&oids, &c.clock_columns).await {
+                    Some(false) => Ok(d),
+                    Some(true) => Err("casts a non-date/time column to a date/time type"),
+                    None => Err("could not check column types"),
+                }
+            }
+            other => other,
+        };
+        // 2. Snapshot, catalog epoch and settings, from the proxy's connection, before the
+        //    query is sent; and that no name the query uses is taken over by a user object.
+        let ready = match deps {
+            Ok(d) => match self.sh.validator.fill_context().await {
+                None => Err("could not take snapshot (or server is a standby)"),
+                Some(_) if fp.gen != self.sh.validator.settings_generation() => {
+                    self.st.lock().fp_stale = true;
+                    Err("server settings changed")
+                }
+                Some(ctx) => {
+                    match self.sh.validator.any_shadowed(&ctx.epoch, &c.functions, &c.operators, &c.types).await {
+                        Some(false) => Ok((d, ctx)),
+                        Some(true) => Err("uses a name a user-defined function, operator or type shares"),
+                        None => Err("could not check function and operator names"),
+                    }
+                }
+            },
+            Err(e) => Err(e),
+        };
+        let (deps, ctx) = match ready {
+            Ok(x) => x,
+            Err(reason) => {
+                // Not cacheable after all: just run it.
+                self.sh.stats.bypass(reason);
+                tracing::debug!(target: "pgshadow::query", conn = self.conn, outcome = "bypass", reason,
+                    shape = %format!("{:016x}", cls.shape));
+                drop(guard);
+                if !parse_sent {
+                    fx.parsed = req.parsed();
+                }
+                return self.forward(req.frames(parse_sent), true, fx, None, None, Some(cls.shape), prefix).await;
+            }
+        };
+        if !parse_sent {
+            fx.parsed = req.parsed_with(Some(dep_set(&deps)));
+        } else if let Req::Extended { bind, .. } = &req {
+            // The Parse already ran (hit path that fell through).
+            let name = bind.statement_name.clone().unwrap_or_default();
+            if let Some(info) = self.st.lock().statements.get_mut(&name) {
+                info.deps = Some(dep_set(&deps));
+            }
+        }
+        // 3. Inside a transaction: whether it has written (by any route) and its isolation
+        //    level, asked right before the query (pipelined: no added latency).
+        let txn_rx = if self.st.lock().status == b'T' {
+            Some(self.swallow(our_query(TXN_SQL, &[]), UnitEffects::default()).await?)
+        } else {
+            None
+        };
+
         let mut capture = Capture { buf: BytesMut::new(), limit: self.sh.cfg.cache.max_entry_size, clean: true };
         capture.buf.extend_from_slice(&prefix);
         let (done_tx, done_rx) = oneshot::channel();
-        let mut fx = UnitEffects::from_effects(&cls.effects);
-        if !parse_sent {
-            fx.parsed = req.parsed();
-        }
-
         self.forward(req.frames(parse_sent), true, fx, Some(capture), Some(done_tx), Some(cls.shape), prefix).await?;
 
         let sh = self.sh.clone();
+        let st = self.st.clone();
         let conn = self.conn;
         tokio::spawn(async move {
-            let prep = prep_rx.await.ok().and_then(|f| rows_of(&f));
+            let txn_ok = match txn_rx {
+                None => true,
+                Some(rx) => match rx.await.ok().and_then(|f| parse_txn(&f, 0)) {
+                    Some((iso, wrote)) => {
+                        let mut st = st.lock();
+                        st.wrote |= wrote;
+                        !wrote && iso.is_some_and(Isolation::is_read_committed)
+                    }
+                    None => false,
+                },
+            };
             let done = done_rx.await.ok();
-            let outcome = finish_fill(&sh, &rels, &fp, prep, done, request, key, compare, &cls);
+            let outcome = if txn_ok {
+                finish_fill(&sh, deps, &fp, ctx, done, request, key, compare, &cls)
+            } else {
+                sh.stats.bypass("transaction has written or is not READ COMMITTED");
+                ("miss", "transaction has written", done.map_or(0, |d| d.elapsed.as_micros() as u64))
+            };
             tracing::debug!(target: "pgshadow::query", conn, outcome = outcome.0, reason = outcome.1,
                 shape = %format!("{:016x}", cls.shape), postgres_micros = outcome.2);
             drop(guard); // releases sessions waiting for this result
@@ -1076,14 +1356,50 @@ impl Session {
     }
 }
 
+/// State of the tables a cacheable statement reads, for a session with these settings.
+async fn prepared_deps(sh: &Arc<Shared>, fp: Option<Arc<SessionFp>>, sql: &str) -> Option<Arc<Vec<(u32, String)>>> {
+    let fp = fp?;
+    if !sh.enabled() || !sh.validator.installed() {
+        return None;
+    }
+    let cls = sh.classifier.get(sql);
+    let rels = &cls.cacheable.as_ref()?.relations;
+    let lookup: Vec<(Option<String>, String)> = rels.iter().map(|r| (r.schema.clone(), r.name.clone())).collect();
+    let states = sh.validator.table_states(&fp.path, &fp.current_user, &lookup).await?;
+    table_deps(rels, &states).ok().map(|d| dep_set(&d))
+}
+
+/// The tables a result depends on, or why it cannot be cached.
+fn table_deps(rels: &[RelName], states: &[Option<crate::validator::TableState>]) -> Result<Vec<TableDep>, &'static str> {
+    let mut deps = Vec::new();
+    for (rel, st) in rels.iter().zip(states) {
+        match st {
+            None if rel.maybe_cte => continue, // a CTE, not a table
+            None => return Err("relation not found"),
+            Some(st) if !st.eligible => return Err("table not enabled for caching"),
+            Some(st) => deps.push(TableDep {
+                oid: st.oid,
+                fp: st.fp.clone(),
+                nsp: rel.schema.clone(),
+                name: rel.name.clone(),
+                lock_name: st.qualified.clone(),
+            }),
+        }
+    }
+    if deps.is_empty() {
+        return Err("reads no tables");
+    }
+    Ok(deps)
+}
+
 /// Decide whether a fresh result can be stored (or, in verify mode, whether it matches).
 /// Returns (outcome, reason, postgres micros) for the log line.
 #[allow(clippy::too_many_arguments)]
 fn finish_fill(
     sh: &Shared,
-    rels: &[RelName],
+    tables: Vec<TableDep>,
     fp: &SessionFp,
-    prep: Option<Vec<Vec<Option<String>>>>,
+    ctx: crate::validator::FillContext,
     done: Option<Done>,
     request: Vec<u8>,
     key: u128,
@@ -1096,50 +1412,16 @@ fn finish_fill(
         sh.stats.bypass("result not cacheable (error, notice, or too large)");
         return ("miss", "result not cacheable", micros);
     };
-    let Some(rows) = prep else {
-        sh.stats.bypass("could not read table state");
-        return ("miss", "could not read table state", micros);
-    };
-    // One row per relation, in order; ord 0 means prep caught an error.
-    if rows.len() != rels.len() || rows.iter().any(|r| r.get(1).cloned().flatten().as_deref() == Some("0")) {
-        sh.stats.bypass("could not read table state");
-        return ("miss", "could not read table state", micros);
-    }
-    let snapshot = rows[0].first().cloned().flatten().unwrap_or_default();
-    let mut tables = Vec::new();
-    for (rel, row) in rels.iter().zip(&rows) {
-        let oid: Option<u32> = row.get(2).cloned().flatten().and_then(|s| s.parse().ok());
-        let eligible = row.get(3).cloned().flatten().as_deref() == Some("t");
-        let tfp = row.get(4).cloned().flatten();
-        match oid {
-            None if rel.maybe_cte => continue, // a CTE, not a table
-            None => {
-                sh.stats.bypass("relation not found");
-                return ("miss", "relation not found", micros);
-            }
-            Some(oid) => {
-                if !eligible {
-                    sh.stats.bypass("table not enabled for caching");
-                    return ("miss", "table not enabled for caching", micros);
-                }
-                let Some(tfp) = tfp else { return ("miss", "could not read table state", micros) };
-                let resolve = rel.schema.is_none().then(|| (rel.name.clone(), fp.schemas.clone()));
-                tables.push(TableDep { oid, fp: tfp, resolve });
-            }
-        }
-    }
-    if tables.is_empty() || snapshot.is_empty() {
-        return ("miss", "reads no tables", micros);
-    }
-    if sh.rel_disabled(tables.iter().map(|t| t.oid)) {
-        return ("miss", "table disabled after verification mismatch", micros);
-    }
     let entry = Entry {
         request: Bytes::from(request),
         response,
-        snapshot,
+        snapshot: ctx.snapshot,
+        epoch: ctx.epoch,
+        settings: ctx.settings,
         tables,
         role: fp.current_user.clone(),
+        path: fp.path.clone(),
+        funcs: cls.cacheable.as_ref().map(|c| c.functions.join(",")).unwrap_or_default(),
         created_unix_ms: now_unix_ms(),
         exec_micros: micros,
     };
@@ -1196,6 +1478,48 @@ fn same_result(a: &[u8], b: &[u8]) -> bool {
     matches!((split(a), split(b)), (Some(x), Some(y)) if x == y)
 }
 
+fn parse_complete() -> Bytes {
+    let mut b = BytesMut::new();
+    Frame::new(b'1', Bytes::new()).encode_into(&mut b);
+    b.freeze()
+}
+
+const LOCK_FAILED: &str = "pgshadow-lock-failed";
+
+/// Lock a cached result's tables the way reading them would. Problems other than a
+/// cancel or timeout (which the client's query would have hit too) become a notice, so
+/// the transaction stays usable and the query can run on Postgres to report them.
+fn lock_sql(tables: &[TableDep]) -> String {
+    let mut names: Vec<&str> = tables.iter().map(|t| t.lock_name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    format!(
+        "DO $pgshadow$ BEGIN LOCK TABLE {} IN ACCESS SHARE MODE; \
+         EXCEPTION WHEN OTHERS THEN RAISE NOTICE '{LOCK_FAILED}'; END $pgshadow$",
+        names.join(", ")
+    )
+}
+
+/// An error without its CONTEXT field (which would name the proxy's DO block).
+fn without_context(f: &Frame) -> Frame {
+    let body = &f.body;
+    let mut out = BytesMut::new();
+    let mut i = 0;
+    while i < body.len() && body[i] != 0 {
+        let end = body[i + 1..].iter().position(|b| *b == 0).map(|p| i + 1 + p).unwrap_or(body.len());
+        if body[i] != b'W' {
+            out.extend_from_slice(&body[i..(end + 1).min(body.len())]);
+        }
+        i = end + 1;
+    }
+    out.extend_from_slice(&[0]);
+    Frame::new(f.tag, out.freeze())
+}
+
+fn notice_is(f: &Frame, msg: &str) -> bool {
+    protocol::error_fields(&f.body).1 == msg
+}
+
 trait ReasonExt {
     fn bypass_reason_or_effect(&self) -> &'static str;
 }
@@ -1219,7 +1543,7 @@ impl ReasonExt for Classified {
 async fn upstream_reader(
     mut rd: FrameReader<ReadHalf<Stream>>,
     mut units: mpsc::UnboundedReceiver<Up>,
-    async_tx: mpsc::UnboundedSender<Bytes>,
+    client_w: ClientW,
     st: Arc<Mutex<State>>,
     sh: Arc<Shared>,
     idle: Arc<tokio::sync::Notify>,
@@ -1227,11 +1551,28 @@ async fn upstream_reader(
     let mut cur: Option<Up> = None;
     let mut had_error = false;
     let mut saw_param_status = false;
+    // Responses for the client are batched: everything already received goes out in one
+    // send, instead of one per message.
+    let mut batch = BytesMut::new();
+    // When the previous unit finished: a unit's own time starts no earlier than this, so
+    // timings exclude waiting behind earlier pipelined requests.
+    let mut prev_end = Instant::now();
     loop {
-        let Some(f) = rd.read_frame().await? else { return Ok(()) };
+        if !batch.is_empty() && (!rd.has_complete_frame() || batch.len() >= 64 * 1024) {
+            write_client(&client_w, &batch.split()).await?;
+        }
+        let Some(f) = rd.read_frame().await? else {
+            if !batch.is_empty() {
+                let _ = write_client(&client_w, &batch).await;
+            }
+            return Ok(());
+        };
         if cur.is_none() {
             match units.try_recv() {
                 Ok(u) => {
+                    if let Up::Forward { prefix, .. } = &u {
+                        batch.extend_from_slice(prefix);
+                    }
                     cur = Some(u);
                     had_error = false;
                     saw_param_status = false;
@@ -1242,7 +1583,7 @@ async fn upstream_reader(
                     if f.tag == b'S' {
                         st.lock().fp_stale = true;
                     }
-                    let _ = async_tx.send(f.to_bytes());
+                    f.encode_into(&mut batch);
                     continue;
                 }
             }
@@ -1254,21 +1595,17 @@ async fn upstream_reader(
             _ => {}
         }
         match unit {
-            Up::Forward { out, capture, .. } => {
+            Up::Forward { capture, .. } => {
                 if f.tag != b'Z' {
                     if let Some(c) = capture.as_mut() {
                         c.push(&f);
                     }
                 }
-                if out.send(f.to_bytes()).await.is_err() {
-                    return Ok(()); // client gone
-                }
+                f.encode_into(&mut batch);
             }
             Up::Swallow { frames, .. } => match f.tag {
-                b'A' | b'S' => {
-                    let _ = async_tx.send(f.to_bytes());
-                }
-                b'N' => {}
+                // asynchronous: the client's
+                b'A' | b'S' => f.encode_into(&mut batch),
                 _ => frames.push(f.clone()),
             },
         }
@@ -1288,7 +1625,9 @@ async fn upstream_reader(
             if status == b'I' {
                 s.wrote = false;
                 s.iso = None;
-            } else if prev == b'I' {
+            } else if prev == b'I' || fx.begin.is_some() || fx.txn_end {
+                // A transaction started in this unit (possibly after others ended in it,
+                // as in "COMMIT; BEGIN ISOLATION LEVEL ...").
                 s.wrote = false;
                 s.iso = match fx.begin {
                     Some(Some(level)) => Some(level),
@@ -1299,7 +1638,7 @@ async fn upstream_reader(
             if fx.writes && status != b'I' {
                 s.wrote = true;
             }
-            if fx.settings || saw_param_status {
+            if fx.settings || fx.dirty || saw_param_status {
                 s.fp_stale = true;
             }
             for (name, info) in fx.parsed {
@@ -1311,9 +1650,11 @@ async fn upstream_reader(
             }
         }
         match unit {
-            Up::Forward { out, capture, done, started, timing_key, .. } => {
-                drop(out);
-                let elapsed = started.elapsed();
+            Up::Forward { capture, done, started, timing_key, .. } => {
+                if !batch.is_empty() {
+                    write_client(&client_w, &batch.split()).await?;
+                }
+                let elapsed = started.max(prev_end).elapsed();
                 if let Some(k) = timing_key {
                     if !had_error {
                         sh.record_time(k, elapsed);
@@ -1330,10 +1671,23 @@ async fn upstream_reader(
                 }
                 SwallowKind::Fingerprint => {
                     let parsed = parse_fp(&frames);
+                    let txn = parse_txn(&frames, 9);
                     let mut s = st.lock();
                     s.fp_refreshing = false;
                     match parsed {
-                        Some(fp) => {
+                        Some(mut fp) => {
+                            fp.gen = s.fp_refresh_gen;
+                            if s.status == b'T' {
+                                // What Postgres says about the transaction beats what the
+                                // proxy inferred from the statements it saw.
+                                match txn {
+                                    Some((iso, wrote)) => {
+                                        s.iso = iso;
+                                        s.wrote |= wrote;
+                                    }
+                                    None => s.wrote = true,
+                                }
+                            }
                             s.fp = Some(Arc::new(fp));
                             s.fp_stale = false;
                         }
@@ -1346,83 +1700,17 @@ async fn upstream_reader(
                 }
             },
         }
+        prev_end = Instant::now();
         if st.lock().pending == 0 {
             idle.notify_waiters();
         }
     }
 }
 
-async fn client_writer(
-    mut w: WriteHalf<Stream>,
-    mut units: mpsc::UnboundedReceiver<Out>,
-    mut async_rx: mpsc::UnboundedReceiver<Bytes>,
-) {
-    let mut buf = BytesMut::with_capacity(64 * 1024);
-    let result: std::io::Result<()> = async {
-        loop {
-            tokio::select! {
-                biased;
-                Some(a) = async_rx.recv() => {
-                    w.write_all(&a).await?;
-                    w.flush().await?;
-                }
-                u = units.recv() => match u {
-                    None => return Ok(()),
-                    Some(Out::Local(b)) => {
-                        w.write_all(&b).await?;
-                        w.flush().await?;
-                    }
-                    Some(Out::Stream { prefix, mut rx }) => {
-                        buf.extend_from_slice(&prefix);
-                        loop {
-                            match rx.try_recv() {
-                                Ok(b) => {
-                                    buf.put_slice(&b);
-                                    if buf.len() >= 64 * 1024 {
-                                        w.write_all(&buf).await?;
-                                        buf.clear();
-                                    }
-                                }
-                                Err(mpsc::error::TryRecvError::Empty) => {
-                                    if !buf.is_empty() {
-                                        w.write_all(&buf).await?;
-                                        buf.clear();
-                                    }
-                                    w.flush().await?;
-                                    tokio::select! {
-                                        biased;
-                                        b = rx.recv() => match b {
-                                            Some(b) => buf.put_slice(&b),
-                                            None => break,
-                                        },
-                                        Some(a) = async_rx.recv() => {
-                                            w.write_all(&a).await?;
-                                        }
-                                    }
-                                }
-                                Err(mpsc::error::TryRecvError::Disconnected) => break,
-                            }
-                        }
-                        if !buf.is_empty() {
-                            w.write_all(&buf).await?;
-                            buf.clear();
-                        }
-                        w.flush().await?;
-                    }
-                }
-            }
-        }
-    }
-    .await;
-    if let Err(e) = result {
-        tracing::debug!(error = %e, "client write ended");
-    }
-    let _ = w.shutdown().await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn result_comparison_ignores_row_order_only() {
@@ -1454,7 +1742,7 @@ mod tests {
     #[test]
     fn fingerprint_parsing() {
         let mut body = BytesMut::new();
-        let cols = ["app", "app", "db", "pg_catalog,public", "0", "read committed", "TimeZone=UTC"];
+        let cols = ["app", "app", "db", "pg_catalog,public", "0", "read committed", "abc", "1760561538.06", "false", "true", "repeatable read"];
         body.put_i16(cols.len() as i16);
         for c in cols {
             body.put_i32(c.len() as i32);
@@ -1463,9 +1751,12 @@ mod tests {
         let frames = vec![Frame::new(b'D', body.freeze()), Frame::new(b'C', Bytes::from_static(b"SELECT 1\0"))];
         let fp = parse_fp(&frames).unwrap();
         assert_eq!(fp.current_user, "app");
-        assert_eq!(fp.schemas, "pg_catalog,public");
+        assert_eq!(fp.path, "pg_catalog,public");
         assert_eq!(fp.temp_rels, 0);
         assert_eq!(fp.default_iso, Some(Isolation::ReadCommitted));
+        assert_eq!(fp.server, "1760561538.06");
+        assert!(!fp.in_recovery);
+        assert_eq!(parse_txn(&frames, 9), Some((Some(Isolation::RepeatableRead), true)));
         assert!(parse_fp(&[protocol::error_frame("ERROR", "42501", "denied")]).is_none());
     }
 }

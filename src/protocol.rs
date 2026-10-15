@@ -7,7 +7,7 @@
 
 use std::io;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use pgwire::messages::{extendedquery, simplequery, DecodeContext, Message};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -18,38 +18,41 @@ pub const SSL_REQUEST: i32 = 80877103;
 pub const GSSENC_REQUEST: i32 = 80877104;
 pub const CANCEL_REQUEST: i32 = 80877102;
 
+/// One protocol message. `raw` is the whole message as on the wire (tag, length, body),
+/// so forwarding never re-encodes; `body` is a view into it.
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub tag: u8,
     pub body: Bytes,
+    raw: Bytes,
 }
 
 impl Frame {
     pub fn new(tag: u8, body: impl Into<Bytes>) -> Self {
-        Self { tag, body: body.into() }
+        let body: Bytes = body.into();
+        let mut raw = BytesMut::with_capacity(5 + body.len());
+        raw.put_u8(tag);
+        raw.put_i32(body.len() as i32 + 4);
+        raw.extend_from_slice(&body);
+        let raw = raw.freeze();
+        Self { tag, body: raw.slice(5..), raw }
     }
 
     pub fn wire_len(&self) -> usize {
-        5 + self.body.len()
+        self.raw.len()
     }
 
     pub fn encode_into(&self, out: &mut BytesMut) {
-        out.reserve(self.wire_len());
-        out.put_u8(self.tag);
-        out.put_i32(self.body.len() as i32 + 4);
-        out.extend_from_slice(&self.body);
+        out.extend_from_slice(&self.raw);
     }
 
     pub fn to_bytes(&self) -> Bytes {
-        let mut b = BytesMut::with_capacity(self.wire_len());
-        self.encode_into(&mut b);
-        b.freeze()
+        self.raw.clone()
     }
 
     /// Decode with one of pgwire's message types.
     pub fn decode<M: Message>(&self) -> Option<M> {
-        let mut buf = BytesMut::with_capacity(self.wire_len());
-        self.encode_into(&mut buf);
+        let mut buf = BytesMut::from(&self.raw[..]);
         M::decode(&mut buf, &decode_ctx()).ok().flatten()
     }
 }
@@ -100,14 +103,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
         let total = 1 + len as usize;
         self.fill(total).await?;
-        let mut f = self.buf.split_to(total);
-        f.advance(5);
-        Ok(Some(Frame { tag, body: f.freeze() }))
+        let raw = self.buf.split_to(total).freeze();
+        Ok(Some(Frame { tag, body: raw.slice(5..), raw }))
     }
 
-    /// Whether more bytes are already buffered (used to batch writes).
-    pub fn has_buffered(&self) -> bool {
-        !self.buf.is_empty()
+    /// Whether a complete message is already buffered (reading it will not wait).
+    pub fn has_complete_frame(&self) -> bool {
+        if self.buf.len() < 5 {
+            return false;
+        }
+        let len = i32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
+        len >= 4 && self.buf.len() > len as usize
     }
 
     /// An untagged startup-phase packet (length-prefixed), returned whole.
@@ -133,6 +139,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 }
 
 pub async fn write_frames<W: AsyncWrite + Unpin>(w: &mut W, frames: &[Frame]) -> io::Result<()> {
+    if let [one] = frames {
+        return w.write_all(&one.raw).await;
+    }
     let mut out = BytesMut::with_capacity(frames.iter().map(Frame::wire_len).sum());
     for f in frames {
         f.encode_into(&mut out);

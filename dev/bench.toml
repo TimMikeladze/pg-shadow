@@ -1,0 +1,19 @@
+[listen]
+addr = "127.0.0.1:6432"
+max_connections = 500
+[upstream]
+host = "127.0.0.1"
+port = 5433
+tls = "disable"
+[check]
+dsn = "host=127.0.0.1 port=5433 user=postgres dbname=shadow"
+connections = 2
+[cache]
+memory = "256MB"
+min_query_time = "1ms"
+[admin]
+addr = "127.0.0.1:9187"
+[log]
+format = "json"
+level = "warn"
+summary_interval = "0s"

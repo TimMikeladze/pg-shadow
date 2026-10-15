@@ -141,6 +141,11 @@ pub struct Cache {
     pub verify_sample_rate: f64,
     /// Remembered statement classifications.
     pub classifier_capacity: usize,
+    /// How long the proxy reuses what it learned about a table (name resolution,
+    /// eligibility, fingerprint) before asking Postgres again. A table enabled or changed
+    /// is picked up within this time; validation never relies on it.
+    #[serde(deserialize_with = "de_duration")]
+    pub table_state_ttl: Duration,
     /// Statements whose cached results are nearly always invalid (their tables change
     /// constantly) stop being cached for this long. 0 disables the pause.
     #[serde(deserialize_with = "de_duration")]
@@ -160,6 +165,7 @@ impl Default for Cache {
             verify_sample_rate: 0.0,
             classifier_capacity: 20_000,
             invalidation_cooldown: Duration::from_secs(60),
+            table_state_ttl: Duration::from_secs(2),
         }
     }
 }

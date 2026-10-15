@@ -97,6 +97,7 @@ pub fn base_config() -> Config {
     cfg.check.timeout = Duration::from_secs(2);
     cfg.cache.memory = 32 << 20;
     cfg.cache.min_query_time = Duration::ZERO;
+    cfg.cache.table_state_ttl = Duration::from_millis(200);
     cfg.admin.addr = String::new();
     cfg.log.summary_interval = Duration::ZERO;
     cfg.changelog.trim_interval = Duration::ZERO;
