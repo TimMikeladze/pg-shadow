@@ -53,6 +53,13 @@ impl Stats {
         *self.bypass.lock().entry(reason).or_default() += 1;
     }
 
+    /// Bypass reasons counted since the last summary line, most frequent first.
+    pub fn bypass_counts(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<_> = self.bypass.lock().iter().map(|(k, n)| (*k, *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
     pub fn inc(c: &AtomicU64) {
         c.fetch_add(1, Ordering::Relaxed);
     }

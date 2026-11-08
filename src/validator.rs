@@ -62,12 +62,17 @@ pub struct Validator {
 /// 0.2 ms). On a fast network that cost is the larger one: depth 4 on Fly (0.6 ms round
 /// trip) cut hit throughput by a third. So depth is round trip / (2 x batch execution
 /// time), clamped to 1..=MAX_PIPELINE, and 1 until both are measured.
+///
+/// Execution time is the shortest of the last BATCH_WINDOW samples, the way `rtt` is the
+/// fastest recent ping: the first batch on a connection (plans, PL/pgSQL compile) and
+/// batches that queued on a busy server would otherwise keep it high. An average
+/// starting from the first batch kept depth at 1 behind a 23 ms round trip on CI.
 #[derive(Default)]
 struct Pipeline {
     depth: AtomicUsize,
-    /// EWMA of batch round trip minus network round trip, for batches sent while nothing
-    /// else was in flight on their connection (otherwise they also waited for those).
-    exec_micros: AtomicU64,
+    /// Batch round trip minus network round trip, for batches sent while nothing else
+    /// was in flight on their connection (otherwise they also waited for those).
+    recent: parking_lot::Mutex<std::collections::VecDeque<u64>>,
 }
 
 impl Pipeline {
@@ -82,13 +87,14 @@ impl Pipeline {
         let sample = batch_micros
             .saturating_sub(rtt_micros)
             .max(MIN_BATCH_EXEC_MICROS);
-        let old = self.exec_micros.load(Ordering::Relaxed);
-        let exec = if old == 0 {
-            sample
-        } else {
-            (old * 7 + sample) / 8
+        let exec = {
+            let mut recent = self.recent.lock();
+            if recent.len() == BATCH_WINDOW {
+                recent.pop_front();
+            }
+            recent.push_back(sample);
+            min_micros(&recent)
         };
-        self.exec_micros.store(exec, Ordering::Relaxed);
         self.depth
             .store(pipeline_depth(rtt_micros, exec), Ordering::Relaxed);
     }
@@ -189,9 +195,12 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const PING_WINDOW: usize = 8;
 /// Most check batches in flight per check connection.
 const MAX_PIPELINE: usize = 8;
-/// Floor for the measured batch execution time, so a noisy sample can't ask for deep
-/// pipelining on a fast network.
-const MIN_BATCH_EXEC_MICROS: u64 = 100;
+/// Floor for the measured batch execution time: about the cheapest check batch
+/// (`validate()` for one item). Keeps a noisy sample from asking for deep pipelining on
+/// a fast network.
+const MIN_BATCH_EXEC_MICROS: u64 = 200;
+/// Batch execution samples kept; the shortest one is used.
+const BATCH_WINDOW: usize = 16;
 /// How often the context worker re-reads the catalog epoch and settings hash.
 const CONTEXT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -828,9 +837,16 @@ mod tests {
         p.observe(500, 0); // no round trip measured yet
         assert_eq!(p.depth(), 1);
         p.observe(650, 600); // noisy sample: floored at MIN_BATCH_EXEC_MICROS
-        assert_eq!(p.depth(), 3);
-        for _ in 0..40 {
-            p.observe(1_000, 600);
+        assert_eq!(p.depth(), 1);
+        // far away: a slow first batch doesn't hold depth down once a fast one is seen
+        let p = Pipeline::default();
+        p.observe(23_000 + 15_000, 23_000);
+        assert_eq!(p.depth(), 1);
+        p.observe(23_000 + 1_000, 23_000);
+        assert_eq!(p.depth(), 8);
+        // and the window follows a server that got slower
+        for _ in 0..BATCH_WINDOW {
+            p.observe(23_000 + 6_000, 23_000);
         }
         assert_eq!(p.depth(), 1);
     }

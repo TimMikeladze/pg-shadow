@@ -9,7 +9,7 @@ The numbers behind the README's *Performance* section. Every pgbench run is one 
 | Fly variants | 8 check connections; pgshadow as a sidecar on the client Machine | `cloud-2026-11-07-final/fly-cc8/`, `fly-sidecar/` |
 | local | Postgres in Docker on a laptop, pgshadow and pgbench next to it | `local-2026-11-07/` |
 
-All of them ran the same build, `7a6907c`. The commit after it fixes a race that could make the request right after a fill miss (see the end); it doesn't change the measured paths otherwise. Older runs are kept for the history at the end: `cloud-2026-11-07-v1` to `v4`, `cloud-2026-11-07-v6-mix`, and `blog-2026-11-07` (the first local run).
+All of them ran the same build, `7a6907c`. Two later commits change the measured code: a race that could make the request right after a fill miss (see the end), and the pipeline depth's estimate of batch time, now the shortest recent batch instead of an average. Depth comes out the same on both targets: 1 on Fly, 8 on Neon. Older runs are kept for the history at the end: `cloud-2026-11-07-v1` to `v4`, `cloud-2026-11-07-v6-mix`, and `blog-2026-11-07` (the first local run).
 
 ## Setup
 

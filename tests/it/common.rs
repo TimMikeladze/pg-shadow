@@ -139,6 +139,19 @@ impl Proxy {
         self.app.shared.stats.hits.load(Ordering::Relaxed)
     }
 
+    /// Counters that explain a missing hit, for assertion messages.
+    pub fn why(&self) -> String {
+        let s = &self.app.shared.stats;
+        format!(
+            "hits {}, fills {}, invalidated {}, check_failed {}, bypassed {:?}",
+            self.hits(),
+            self.fills(),
+            s.invalidated.load(Ordering::Relaxed),
+            s.check_failed.load(Ordering::Relaxed),
+            s.bypass_counts()
+        )
+    }
+
     pub fn fills(&self) -> u64 {
         self.app.shared.stats.fills.load(Ordering::Relaxed)
     }

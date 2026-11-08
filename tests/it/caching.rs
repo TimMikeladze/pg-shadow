@@ -34,7 +34,7 @@ async fn hits_are_byte_identical_to_postgres() {
             want_bin,
             "hit differs: {q}"
         );
-        assert_eq!(p.hits(), hits + 1, "expected a hit: {q}");
+        assert_eq!(p.hits(), hits + 1, "expected a hit: {q}; {}", p.why());
         // simple protocol, text results
         assert_eq!(
             simple_rows(&c, q).await,
@@ -47,7 +47,7 @@ async fn hits_are_byte_identical_to_postgres() {
             want_txt,
             "hit differs (text): {q}"
         );
-        assert_eq!(p.hits(), hits + 2, "expected a text hit: {q}");
+        assert_eq!(p.hits(), hits + 2, "expected a text hit: {q}; {}", p.why());
     }
 }
 
@@ -70,7 +70,8 @@ async fn a_request_right_after_a_fill_can_hit() {
         assert_eq!(
             p.hits(),
             hits + 1,
-            "request {i} right after its fill missed"
+            "request {i} right after its fill missed; {}",
+            p.why()
         );
     }
 }
