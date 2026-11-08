@@ -1,22 +1,22 @@
 
 running 20 tests
 test cache::tests::entry_roundtrip_and_checksum ... ok
+test config::tests::sizes_and_durations ... ok
+test session::tests::cooldown_needs_enough_checks ... ok
+test protocol::tests::arrays_and_rows ... ok
+test server::tests::channel_binding_is_stripped ... ok
+test validator::tests::pipeline_depth_follows_round_trip_over_execution_time ... ok
+test protocol::tests::frames_roundtrip ... ok
+test session::tests::fingerprint_parsing ... ok
+test config::tests::file_and_validation ... ok
+test session::tests::result_comparison_ignores_row_order_only ... ok
 test classify::tests::names_for_the_shadowing_check ... ok
+test classify::tests::writes_and_multi_statements_are_not_cacheable ... ok
 test classify::tests::date_cast_columns_are_reported ... ok
 test classify::tests::relations_include_cte_shadowed_tables ... ok
-test config::tests::sizes_and_durations ... ok
-test protocol::tests::arrays_and_rows ... ok
-test config::tests::file_and_validation ... ok
-test server::tests::channel_binding_is_stripped ... ok
-test session::tests::cooldown_needs_enough_checks ... ok
-test protocol::tests::frames_roundtrip ... ok
 test classify::tests::date_casts_of_columns_and_constants_stay_cacheable ... ok
-test classify::tests::writes_and_multi_statements_are_not_cacheable ... ok
-test session::tests::fingerprint_parsing ... ok
-test session::tests::result_comparison_ignores_row_order_only ... ok
-test validator::tests::pipeline_depth_follows_round_trip_over_execution_time ... ok
-test classify::tests::effects ... ok
 test classify::tests::plain_selects_are_cacheable ... ok
+test classify::tests::effects ... ok
 test classify::tests::shape_memo_agrees_with_full_classification ... ok
 test classify::tests::nondeterminism_is_not_cacheable ... ok
 test cache::tests::store_memory_and_disk ... ok
@@ -24,7 +24,7 @@ test cache::tests::store_memory_and_disk ... ok
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 
-running 42 tests
+running 43 tests
 test audit::partitions_and_inheritance_children_are_refused ... ok
 test audit::transaction_boundaries_inside_one_message ... ok
 test audit::clock_dependent_parameters_of_any_length ... ok
@@ -33,30 +33,31 @@ test audit::schemas_renamed_created_or_revoked ... ok
 test basics::copy_in_and_out ... ok
 test basics::password_logins_are_relayed ... ok
 test audit::other_databases_are_not_cached ... ok
-test audit::writes_and_setting_changes_hidden_in_reads ... ok
 test audit::text_cast_to_dates_and_prepared_statement_shapes ... ok
+test audit::writes_and_setting_changes_hidden_in_reads ... ok
 test basics::session_state_is_preserved ... ok
 test basics::queries_errors_and_transactions_pass_through ... ok
-test basics::pipelined_queries_keep_their_order ... ok
 test basics::tls_on_both_sides ... ok
+test basics::pipelined_queries_keep_their_order ... ok
 test caching::checks_are_not_pipelined_on_a_fast_network ... ok
-test caching::hits_are_byte_identical_to_postgres ... ok
 test caching::disk_tier_survives_restart ... ok
-test caching::kill_switch ... ok
 test basics::cancel_requests_reach_postgres ... ok
+test caching::hits_are_byte_identical_to_postgres ... ok
 test caching::concurrent_misses_run_once ... ok
-test caching::prepared_statements_and_parameters ... ok
-test caching::only_safe_queries_are_cached ... ok
+test caching::kill_switch ... ok
+test caching::a_request_right_after_a_fill_can_hit ... ok
 test audit::user_defined_functions_operators_and_types ... ok
+test caching::prepared_statements_and_parameters ... ok
 test caching::transaction_rules ... ok
+test caching::only_safe_queries_are_cached ... ok
 test audit::hits_inside_transactions_take_table_locks ... ok
-test caching::verify_mode_compares_hits_with_postgres ... ok
 test caching::a_miss_takes_one_round_trip_behind_a_slow_network ... ok
+test caching::verify_mode_compares_hits_with_postgres ... ok
 test caching::writes_invalidate_immediately ... ok
-test caching::validation_does_not_scan_the_changelog ... ok
 test gaps::cascades_and_ctes ... ok
-test gaps::changelog_trimming ... ok
+test caching::validation_does_not_scan_the_changelog ... ok
 test gaps::in_progress_writer_commits_after_fill ... ok
+test gaps::changelog_trimming ... ok
 test gaps::name_resolution_and_session_settings ... ok
 test gaps::schema_changes ... ok
 test gaps::trigger_tampering_and_replica_mode ... ok
@@ -68,5 +69,5 @@ test gaps::tables_disabled_or_dropped ... ok
 test caching::verify_mode_ignores_writes_racing_the_rerun ... ok
 test staleness::no_stale_reads_under_concurrent_writes ... ok
 
-test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.06s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.19s
 

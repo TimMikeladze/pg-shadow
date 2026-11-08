@@ -56,4 +56,4 @@ drop cascades to cast from zz_ct to integer
 NOTICE:  type "zz_ct" does not exist, skipping
 NOTICE:  view "vw1" does not exist, skipping
 ok    view: refused without an error
-validate() server time for one item (warm session): 0.435 ms
+validate() server time for one item (warm session): 0.527 ms

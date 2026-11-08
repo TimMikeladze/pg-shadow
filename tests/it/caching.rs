@@ -51,6 +51,30 @@ async fn hits_are_byte_identical_to_postgres() {
     }
 }
 
+/// A fill queues a re-read of the session's settings right behind the query. A client that
+/// sends its next request as soon as the fill's response arrives must still get a hit:
+/// the proxy used to mark the session idle before storing the settings it had read, so
+/// a request arriving in between skipped the cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_right_after_a_fill_can_hit() {
+    let p = proxy().await;
+    let d = direct().await;
+    table(&d, "c_fill_then_hit", 50, true).await;
+    let c = p.client().await;
+    for i in 0..200u64 {
+        let q = format!("SELECT grp, sum(v) + {i} FROM c_fill_then_hit GROUP BY grp ORDER BY grp");
+        simple_rows(&c, &q).await;
+        p.wait_fills(i + 1).await;
+        let hits = p.hits();
+        simple_rows(&c, &q).await;
+        assert_eq!(
+            p.hits(),
+            hits + 1,
+            "request {i} right after its fill missed"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_invalidate_immediately() {
     let p = proxy().await;
@@ -365,8 +389,9 @@ async fn concurrent_misses_run_once() {
 }
 
 /// min_query_time is about the time Postgres spends, not the distance to it. Behind a
-/// 20 ms round trip a primary-key lookup takes 20 ms as the proxy sees it; after its
-/// three timed runs it must still count as cheap and stop being filled.
+/// 20 ms round trip a primary-key lookup takes 20 ms as the proxy sees it; it must still
+/// count as cheap and stop being filled. The first batch can fill a few: a timed run that
+/// queued behind other tests looks slow, and the average needs a few runs to come down.
 #[tokio::test(flavor = "multi_thread")]
 async fn min_query_time_excludes_the_network_round_trip() {
     let p = slow_proxy(Duration::from_millis(10), |c| {
@@ -376,16 +401,28 @@ async fn min_query_time_excludes_the_network_round_trip() {
     let d = direct().await;
     table(&d, "c_rtt", 100, true).await;
     let c = p.client().await;
-    for id in 1..=12 {
-        c.query("SELECT v FROM c_rtt WHERE id = $1", &[&id])
-            .await
-            .unwrap();
-    }
+    let lookups = |ids: std::ops::RangeInclusive<i32>| {
+        let c = &c;
+        async move {
+            for id in ids {
+                c.query("SELECT v FROM c_rtt WHERE id = $1", &[&id])
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    lookups(1..=12).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let fills = p.fills();
-    eprintln!("rtt {:?}, fills {fills}", p.app.shared.validator.rtt());
+    let warm = p.fills();
+    lookups(13..=24).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let fills = p.fills() - warm;
+    eprintln!(
+        "rtt {:?}, fills {warm} then {fills}",
+        p.app.shared.validator.rtt()
+    );
     assert!(
-        fills <= 4,
+        fills <= 2,
         "a 20 ms round trip made a cheap lookup look slow: {fills} of 12 filled"
     );
 }

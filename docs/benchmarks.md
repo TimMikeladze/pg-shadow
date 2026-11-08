@@ -9,7 +9,7 @@ The numbers behind the README's *Performance* section. Every pgbench run is one 
 | Fly variants | 8 check connections; pgshadow as a sidecar on the client Machine | `cloud-2026-11-07-final/fly-cc8/`, `fly-sidecar/` |
 | local | Postgres in Docker on a laptop, pgshadow and pgbench next to it | `local-2026-11-07/` |
 
-All of them ran the same build (`910a8a0` plus the uncommitted changes that went into the commit with this doc). Older runs are kept for the history at the end: `cloud-2026-11-07-v1` to `v4`, `cloud-2026-11-07-v6-mix`, and `blog-2026-11-07` (the first local run).
+All of them ran the same build, `7a6907c`. The commit after it fixes a race that could make the request right after a fill miss (see the end); it doesn't change the measured paths otherwise. Older runs are kept for the history at the end: `cloud-2026-11-07-v1` to `v4`, `cloud-2026-11-07-v6-mix`, and `blog-2026-11-07` (the first local run).
 
 ## Setup
 
@@ -76,8 +76,8 @@ bench/fly.sh down          # destroys the app, its Machines and the volume
 | run | result |
 |---|---|
 | `cargo test --lib` | 20 passed |
-| `cargo test --test it`, local Postgres 16 | 42 passed |
-| `cargo test --test it`, Fly Postgres 18 | 42 passed |
+| `cargo test --test it`, local Postgres 16 | 43 passed |
+| `cargo test --test it`, Fly Postgres 18 | 42 passed (before `a_request_right_after_a_fill_can_hit` was added) |
 | `bench/sql-check.sh` | 38 ok, 0 FAIL |
 | `py_tests` (psycopg, SQLAlchemy) | 11 passed |
 | staleness oracle, local, 300 s | 1,281,037 reads, 916,949 cache hits, 118,458 writes, 0 stale reads |
@@ -323,5 +323,7 @@ The first local runs had no network between pgshadow and Postgres, which hid mos
 - **`invalidation_cooldown` fired during warm-up** (`v4`). It needed only 20 failed checks, so one write while the 50 per-customer variants were still filling paused the statement for the whole run: on Fly at 10 UPDATEs/s, 447 tps instead of about 2,000. It now waits for 500 checks.
 - **Caching that costs round trips wasn't paused** (`v6-mix`). On Neon at 10 UPDATEs/s, 22% of per-customer reads hit and the rest paid an extra round trip: 454 tps through pgshadow against 639 direct. The cooldown now also fires when failed checks × round trip exceed hits × statement time.
 - **Fills were timed at about 0 ms behind a distant database.** A fill's query was timed from its snapshot's response and then had the round trip subtracted a second time, so after a few fills a 10 ms statement looked cheaper than `min_query_time`. Found while checking the cooldown above, fixed before the final runs.
+
+- **A request right after a fill could miss.** The proxy marked the session idle before storing the settings read it had queued behind the fill, so a request arriving in between skipped the cache. CI's slower runners hit it; locally a loop of 200 fill-then-hit pairs failed 3 runs out of 5. Fixed after the final runs.
 
 Each fix has a test that fails on the old code; `tests/it/caching.rs` runs the proxy through a TCP relay that adds 10 ms each way.

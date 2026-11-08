@@ -2075,7 +2075,6 @@ async fn upstream_reader(
             let mut s = st.lock();
             let prev = s.status;
             s.status = status;
-            s.pending = s.pending.saturating_sub(1);
             if status == b'I' {
                 s.wrote = false;
                 s.iso = None;
@@ -2171,7 +2170,14 @@ async fn upstream_reader(
             },
         }
         prev_end = Instant::now();
-        if st.lock().pending == 0 {
+        // Only now, after the unit's effects (a fill's response, a settings read) are
+        // applied: a request waiting for the session to be idle must see them.
+        let now_idle = {
+            let mut s = st.lock();
+            s.pending = s.pending.saturating_sub(1);
+            s.pending == 0
+        };
+        if now_idle {
             idle.notify_waiters();
         }
     }
