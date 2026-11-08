@@ -1456,7 +1456,8 @@ impl Session {
                         let mut b = BytesMut::with_capacity(entry.response.len() + 6);
                         b.extend_from_slice(&entry.response);
                         protocol::ready_for_query(status).encode_into(&mut b);
-                        self.local(&b).await?;
+                        // Counted before the client has the response, so a client that
+                        // reads the stats right after its query sees this hit.
                         let stats = &self.sh.stats;
                         Stats::inc(&stats.hits);
                         stats
@@ -1465,6 +1466,7 @@ impl Session {
                         stats
                             .saved_micros
                             .fetch_add(entry.exec_micros, Ordering::Relaxed);
+                        self.local(&b).await?;
                         tracing::debug!(target: "pgshadow::query", conn = self.conn, outcome = "hit",
                             shape = %format!("{:016x}", cls.shape), micros = started.elapsed().as_micros() as u64,
                             postgres_micros = entry.exec_micros, bytes = entry.response.len());

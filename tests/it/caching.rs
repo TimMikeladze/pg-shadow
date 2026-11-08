@@ -542,12 +542,13 @@ async fn concurrent_hits(p: std::sync::Arc<Proxy>, name: &str) -> Duration {
     total / 16
 }
 
-/// Behind a 20 ms round trip, a hit costs one round trip to Postgres, also with many
+/// Behind a 50 ms round trip, a hit costs one round trip to Postgres, also with many
 /// clients at once: check batches are pipelined, so hits don't wait for a check
-/// connection to come back first.
+/// connection to come back first. (On a loaded CI runner a check batch takes about 4 ms,
+/// so a shorter round trip leaves too little room between one and two round trips.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hits_take_one_round_trip_behind_a_slow_network() {
-    let p = std::sync::Arc::new(slow_proxy(Duration::from_millis(10), |_| {}).await);
+    let p = std::sync::Arc::new(slow_proxy(Duration::from_millis(25), |_| {}).await);
     let rtt = p.app.shared.validator.rtt();
     let mean = concurrent_hits(p.clone(), "c_rtt_hits").await;
     let depth = p.app.shared.validator.pipeline_depth();
