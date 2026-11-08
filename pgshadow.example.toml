@@ -17,7 +17,7 @@ connect_timeout = "10s"
 
 [check]                          # the proxy's own connections (validation, maintenance)
 dsn = "host=example.tsdb.cloud.timescale.com port=5432 dbname=tsdb user=pgshadow password=secret"  # example
-connections = 2                  # parallel batched checks
+connections = 2                  # check connections; each pipelines up to 8 batches when Postgres is far away
 timeout = "250ms"                # slower check = serve from Postgres instead
 max_batch = 256
 
@@ -28,11 +28,11 @@ memory = "512MB"
 disk_capacity = "8GB"
 max_entry_size = "8MB"           # larger results stream through uncached
 ttl = "10m"                      # must be shorter than changelog.retention
-min_query_time = "3ms"           # cheaper queries are not worth a check round trip
+min_query_time = "3ms"           # cheaper queries are not worth a check round trip (network round trip excluded)
 verify_sample_rate = 0.0         # e.g. 0.01 = re-run 1% of hits on Postgres and compare
 classifier_capacity = 20000
 table_state_ttl = "2s"
-invalidation_cooldown = "60s"
+invalidation_cooldown = "60s"    # pause a statement whose checks mostly fail (see README)
 
 [changelog]
 retention = "15m"

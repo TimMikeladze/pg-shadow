@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use pgshadow::app::{self, App};
 use pgshadow::config::{Config, TlsMode};
 use tokio::sync::OnceCell;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, NoTls};
 
@@ -12,7 +13,42 @@ pub fn pg_dsn() -> String {
         .unwrap_or_else(|_| "host=127.0.0.1 port=5433 user=postgres dbname=shadow".into())
 }
 
-fn pg_host_port() -> (String, u16) {
+fn pg_config() -> tokio_postgres::Config {
+    pg_dsn().parse().expect("PGSHADOW_TEST_PG")
+}
+
+/// `sslmode=require` in PGSHADOW_TEST_PG: TLS to Postgres from the tests and the proxy.
+pub fn pg_tls() -> bool {
+    pg_config().get_ssl_mode() == SslMode::Require
+}
+
+/// Whether PGSHADOW_TEST_PG carries a password (so the server doesn't trust the user).
+pub fn pg_has_password() -> bool {
+    pg_config().get_password().is_some()
+}
+
+/// The test database, `shadow` unless PGSHADOW_TEST_PG names another.
+pub fn pg_db() -> String {
+    pg_config().get_dbname().unwrap_or("shadow").to_string()
+}
+
+/// A conninfo for the proxy on `port` as the test DSN's user (and password).
+pub fn proxy_dsn(port: u16, db: &str) -> String {
+    let cfg = pg_config();
+    let mut dsn = format!(
+        "host=127.0.0.1 port={port} user={} dbname={db}",
+        cfg.get_user().unwrap_or("postgres")
+    );
+    if let Some(pw) = cfg.get_password() {
+        let pw = String::from_utf8_lossy(pw)
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
+        dsn.push_str(&format!(" password='{pw}'"));
+    }
+    dsn
+}
+
+pub fn pg_host_port() -> (String, u16) {
     let cfg: tokio_postgres::Config = pg_dsn().parse().unwrap();
     let host = match &cfg.get_hosts()[0] {
         tokio_postgres::config::Host::Tcp(h) => h.clone(),
@@ -29,9 +65,31 @@ pub async fn direct() -> Client {
 }
 
 pub async fn connect_dsn(dsn: &str) -> Client {
-    let (c, conn) = tokio_postgres::connect(dsn, NoTls)
+    let cfg: tokio_postgres::Config = dsn.parse().unwrap();
+    // Never print a password in a panic message.
+    let shown: Vec<&str> = dsn
+        .split_whitespace()
+        .filter(|kv| !kv.starts_with("password="))
+        .collect();
+    let shown = shown.join(" ");
+    if cfg.get_ssl_mode() == SslMode::Require {
+        // TlsMode::Require encrypts without verifying the certificate, like libpq's sslmode=require.
+        let tls = pgshadow::net::client_tls_config(TlsMode::Require, None).unwrap();
+        let (c, conn) = cfg
+            .connect(tokio_postgres_rustls::MakeRustlsConnect::new(
+                (*tls).clone(),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("connect {shown}: {e}"));
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        return c;
+    }
+    let (c, conn) = cfg
+        .connect(NoTls)
         .await
-        .unwrap_or_else(|e| panic!("connect {dsn}: {e}"));
+        .unwrap_or_else(|e| panic!("connect {shown}: {e}"));
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -56,7 +114,7 @@ pub async fn isolated_db(name: &str) -> String {
     if !exists {
         let _ = d.batch_execute(&format!("CREATE DATABASE {name}")).await;
     }
-    let dsn = pg_dsn().replace("dbname=shadow", &format!("dbname={name}"));
+    let dsn = pg_dsn().replace(&format!("dbname={}", pg_db()), &format!("dbname={name}"));
     let c = connect_dsn(&dsn).await;
     c.batch_execute(pgshadow::admin::SCHEMA_SQL)
         .await
@@ -66,18 +124,11 @@ pub async fn isolated_db(name: &str) -> String {
 
 impl Proxy {
     pub fn dsn(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=shadow",
-            self.port
-        )
+        proxy_dsn(self.port, &pg_db())
     }
 
     pub async fn client_db(&self, db: &str) -> Client {
-        connect_dsn(&format!(
-            "host=127.0.0.1 port={} user=postgres dbname={db}",
-            self.port
-        ))
-        .await
+        connect_dsn(&proxy_dsn(self.port, db)).await
     }
 
     pub async fn client(&self) -> Client {
@@ -112,7 +163,11 @@ pub fn base_config() -> Config {
     cfg.listen.addr = "127.0.0.1:0".into();
     cfg.upstream.host = host;
     cfg.upstream.port = port;
-    cfg.upstream.tls = TlsMode::Disable;
+    cfg.upstream.tls = if pg_tls() {
+        TlsMode::Require
+    } else {
+        TlsMode::Disable
+    };
     cfg.check.dsn = pg_dsn();
     cfg.check.timeout = Duration::from_secs(2);
     cfg.cache.memory = 32 << 20;
@@ -220,4 +275,82 @@ pub async fn simple_rows(c: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
         }
     }
     out
+}
+
+/// A TCP relay to the test Postgres that delivers every chunk `delay` after it arrived,
+/// in each direction, like a link with that latency: the proxy sees a round trip of
+/// about 2 * delay. Returns its port.
+pub async fn slow_relay(delay: Duration) -> u16 {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    fn link(
+        mut r: impl AsyncRead + Unpin + Send + 'static,
+        mut w: impl AsyncWrite + Unpin + Send + 'static,
+        delay: Duration,
+    ) {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 << 10];
+            while let Ok(n) = r.read(&mut buf).await {
+                if n == 0
+                    || tx
+                        .send((tokio::time::Instant::now() + delay, buf[..n].to_vec()))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some((at, chunk)) = rx.recv().await {
+                tokio::time::sleep_until(at).await;
+                if w.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let (host, port) = pg_host_port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect((host.as_str(), port)).await else {
+                continue;
+            };
+            // Like the proxy and Postgres. Without it Nagle holds a second write until the
+            // first is acked, and Linux delays that ack by up to 40 ms.
+            let _ = client.set_nodelay(true);
+            let _ = server.set_nodelay(true);
+            let (cr, cw) = client.into_split();
+            let (sr, sw) = server.into_split();
+            link(cr, sw, delay);
+            link(sr, cw, delay);
+        }
+    });
+    relay
+}
+
+/// A proxy whose upstream and check connections go through `slow_relay(delay)`, returned
+/// once it has measured the round trip.
+pub async fn slow_proxy(delay: Duration, tweak: impl FnOnce(&mut Config)) -> Proxy {
+    let relay = slow_relay(delay).await;
+    let mut check = proxy_dsn(relay, &pg_db());
+    if pg_tls() {
+        check.push_str(" sslmode=require");
+    }
+    let p = proxy_with(|c| {
+        c.upstream.host = "127.0.0.1".into();
+        c.upstream.port = relay;
+        c.check.dsn = check;
+        c.check.timeout = Duration::from_secs(2);
+        tweak(c);
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while p.app.shared.validator.rtt() < delay * 3 / 2 {
+        assert!(Instant::now() < deadline, "round trip never measured");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    p
 }

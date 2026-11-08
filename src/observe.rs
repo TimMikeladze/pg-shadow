@@ -40,6 +40,8 @@ pub struct Stats {
     pub check_failed: AtomicU64,
     pub verify_ok: AtomicU64,
     pub verify_mismatch: AtomicU64,
+    /// Verified hits whose re-run differed because a write committed in between.
+    pub verify_raced: AtomicU64,
     pub hit_bytes: AtomicU64,
     /// Sum of the original Postgres execution time of every result served from cache.
     pub saved_micros: AtomicU64,
@@ -69,6 +71,7 @@ struct Snapshot {
     check_failed: u64,
     verify_ok: u64,
     verify_mismatch: u64,
+    verify_raced: u64,
     hit_bytes: u64,
     saved_micros: u64,
 }
@@ -83,6 +86,7 @@ fn snap(s: &Stats) -> Snapshot {
         check_failed: l(&s.check_failed),
         verify_ok: l(&s.verify_ok),
         verify_mismatch: l(&s.verify_mismatch),
+        verify_raced: l(&s.verify_raced),
         hit_bytes: l(&s.hit_bytes),
         saved_micros: l(&s.saved_micros),
     }
@@ -122,6 +126,7 @@ pub fn spawn_summary(
                 check_failed = d(|s| s.check_failed),
                 verify_ok = d(|s| s.verify_ok),
                 verify_mismatch = d(|s| s.verify_mismatch),
+                verify_raced = d(|s| s.verify_raced),
                 hit_bytes = d(|s| s.hit_bytes),
                 postgres_ms_saved = d(|s| s.saved_micros) / 1000,
                 cache_memory_bytes = memory_usage() as u64,

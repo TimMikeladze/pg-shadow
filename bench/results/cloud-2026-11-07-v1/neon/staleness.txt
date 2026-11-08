@@ -1,0 +1,17 @@
+
+running 1 test
+test staleness::no_stale_reads_under_concurrent_writes has been running for over 60 seconds
+staleness: 6531 writes, 4591 reads, 41 cache hits, 4550 fills, 4547 invalidated, 0 violations
+
+thread 'staleness::no_stale_reads_under_concurrent_writes' (2284) panicked at tests/it/staleness.rs:221:5:
+the cache should have served reads between writes (hits = 41)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test staleness::no_stale_reads_under_concurrent_writes ... FAILED
+
+failures:
+
+failures:
+    staleness::no_stale_reads_under_concurrent_writes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 120.89s
+

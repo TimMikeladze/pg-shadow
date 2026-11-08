@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# Bench client for bench/fly.sh: pgshadow, the integration test binary, pgbench and psql 18.
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src src
+COPY sql sql
+COPY benches benches
+COPY tests tests
+RUN cargo build --release --locked --bin pgshadow \
+    && cargo test --release --locked --test it --no-run \
+    && cp "$(ls -t target/release/deps/it-* | grep -v '\.d$' | head -1)" /it
+
+FROM postgres:18-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends python3 curl ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /pgshadow
+COPY --from=build /src/target/release/pgshadow target/release/pgshadow
+COPY --from=build /it target/release/it
+COPY bench bench
+COPY sql sql
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

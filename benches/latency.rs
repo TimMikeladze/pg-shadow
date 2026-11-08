@@ -1,18 +1,26 @@
 // Sequential round-trip latency through the proxy vs direct (single connection).
+// PGSHADOW_DIRECT_DSN and PGSHADOW_PROXY_DSN override the default ports 5433 and 6432.
 use std::time::Instant;
 #[tokio::main]
 async fn main() {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     for (name, dsn) in [
         (
             "direct",
-            "host=127.0.0.1 port=5433 user=postgres dbname=shadow",
+            env(
+                "PGSHADOW_DIRECT_DSN",
+                "host=127.0.0.1 port=5433 user=postgres dbname=shadow",
+            ),
         ),
         (
             "pgshadow",
-            "host=127.0.0.1 port=6432 user=postgres dbname=shadow",
+            env(
+                "PGSHADOW_PROXY_DSN",
+                "host=127.0.0.1 port=6432 user=postgres dbname=shadow",
+            ),
         ),
     ] {
-        let (c, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .unwrap();
         tokio::spawn(conn);

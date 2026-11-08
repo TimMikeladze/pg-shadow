@@ -602,6 +602,10 @@ impl RawConn {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn simple_query_hit_destroys_the_unnamed_statement() {
+    if pg_has_password() {
+        eprintln!("skipped: RawConn has no password authentication");
+        return;
+    }
     let p = proxy().await;
     let d = direct().await;
     table(&d, "a_un", 10, true).await;

@@ -1,0 +1,60 @@
+
+running 36 tests
+test audit::partitions_and_inheritance_children_are_refused ... ok
+test audit::clock_dependent_parameters_of_any_length ... ok
+test audit::transaction_boundaries_inside_one_message ... ok
+test audit::schemas_renamed_created_or_revoked ... ok
+test basics::copy_in_and_out ... ok
+test audit::text_cast_to_dates_and_prepared_statement_shapes ... ok
+test audit::other_databases_are_not_cached ... ok
+test basics::password_logins_are_relayed ... ok
+test audit::writes_and_setting_changes_hidden_in_reads ... ok
+test basics::session_state_is_preserved ... ok
+test basics::queries_errors_and_transactions_pass_through ... ok
+test basics::cancel_requests_reach_postgres ... ok
+test basics::pipelined_queries_keep_their_order ... ok
+test caching::kill_switch ... ok
+test caching::disk_tier_survives_restart ... ok
+test basics::tls_on_both_sides ... ok
+test audit::user_defined_functions_operators_and_types ... ok
+test caching::hits_are_byte_identical_to_postgres ... ok
+test caching::prepared_statements_and_parameters ... ok
+test audit::hits_inside_transactions_take_table_locks ... ok
+test caching::only_safe_queries_are_cached ... ok
+test caching::concurrent_misses_run_once ... ok
+test caching::transaction_rules ... ok
+test caching::verify_mode_compares_hits_with_postgres ... ok
+test caching::writes_invalidate_immediately ... ok
+test gaps::cascades_and_ctes ... ok
+test gaps::in_progress_writer_commits_after_fill ... ok
+test gaps::changelog_trimming ... ok
+test gaps::name_resolution_and_session_settings ... ok
+test gaps::schema_changes ... ok
+test gaps::trigger_tampering_and_replica_mode ... ok
+test gaps::privileges ... ok
+test gaps::tables_disabled_or_dropped ... ok
+test caching::verify_mode_ignores_writes_racing_the_rerun ... FAILED
+test audit::simple_query_hit_destroys_the_unnamed_statement ... FAILED
+test staleness::no_stale_reads_under_concurrent_writes ... ok
+
+failures:
+
+---- caching::verify_mode_ignores_writes_racing_the_rerun stdout ----
+verify race: 0 ok, 580 raced, 0 mismatches
+
+thread 'caching::verify_mode_ignores_writes_racing_the_rerun' (2226) panicked at tests/it/caching.rs:318:5:
+some hits should have been verified
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- audit::simple_query_hit_destroys_the_unnamed_statement stdout ----
+
+thread 'audit::simple_query_hit_destroys_the_unnamed_statement' (2066) panicked at tests/it/audit.rs:584:18:
+called `Result::unwrap()` on an `Err` value: Elapsed(())
+
+
+failures:
+    audit::simple_query_hit_destroys_the_unnamed_statement
+    caching::verify_mode_ignores_writes_racing_the_rerun
+
+test result: FAILED. 34 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.29s
+

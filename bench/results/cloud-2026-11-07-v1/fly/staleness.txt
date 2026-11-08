@@ -1,0 +1,8 @@
+
+running 1 test
+test staleness::no_stale_reads_under_concurrent_writes has been running for over 60 seconds
+staleness: 42047 writes, 110958 reads, 38421 cache hits, 72537 fills, 72502 invalidated, 0 violations
+test staleness::no_stale_reads_under_concurrent_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 120.24s
+

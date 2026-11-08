@@ -270,6 +270,59 @@ async fn verify_mode_compares_hits_with_postgres() {
     assert_eq!(s.verify_mismatch.load(Ordering::Relaxed), 0);
 }
 
+/// A write that commits between a hit's validation and the verify re-run changes the
+/// re-run's result. That is a race, not a stale hit, and must not count as a mismatch
+/// (which would turn caching off for the table for an hour).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verify_mode_ignores_writes_racing_the_rerun() {
+    let p = std::sync::Arc::new(
+        proxy_with(|c| {
+            c.cache.verify_sample_rate = 1.0;
+            c.cache.invalidation_cooldown = Duration::ZERO;
+        })
+        .await,
+    );
+    let d = direct().await;
+    table(&d, "c_verify_race", 16, true).await;
+    let stop = std::time::Instant::now() + Duration::from_secs(4);
+    let writer = tokio::spawn(async move {
+        while std::time::Instant::now() < stop {
+            d.batch_execute("UPDATE c_verify_race SET v = v + 1 WHERE id = 1")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+    });
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let p = p.clone();
+        readers.push(tokio::spawn(async move {
+            let c = p.client().await;
+            while std::time::Instant::now() < stop {
+                simple_rows(&c, "SELECT sum(v) FROM c_verify_race").await;
+            }
+        }));
+    }
+    writer.await.unwrap();
+    for r in readers {
+        r.await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let s = &p.app.shared.stats;
+    let (ok, raced, bad) = (
+        s.verify_ok.load(Ordering::Relaxed),
+        s.verify_raced.load(Ordering::Relaxed),
+        s.verify_mismatch.load(Ordering::Relaxed),
+    );
+    eprintln!("verify race: {ok} ok, {raced} raced, {bad} mismatches");
+    // Over a network nearly every re-run can race the writer; raced counts as verified.
+    assert!(ok + raced > 0, "some hits should have been verified");
+    assert_eq!(
+        bad, 0,
+        "writes racing the re-run were reported as mismatches"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_switch() {
     let p = proxy().await;
@@ -309,4 +362,215 @@ async fn concurrent_misses_run_once() {
     let (f, h) = (p.fills(), p.hits());
     let bypass = format!("{:?}", p.app.shared.stats.invalidated);
     assert_eq!((f, h), (1, 7), "one session should run the query and the others reuse it (fills, hits); invalidated={bypass}");
+}
+
+/// min_query_time is about the time Postgres spends, not the distance to it. Behind a
+/// 20 ms round trip a primary-key lookup takes 20 ms as the proxy sees it; after its
+/// three timed runs it must still count as cheap and stop being filled.
+#[tokio::test(flavor = "multi_thread")]
+async fn min_query_time_excludes_the_network_round_trip() {
+    let p = slow_proxy(Duration::from_millis(10), |c| {
+        c.cache.min_query_time = Duration::from_millis(3);
+    })
+    .await;
+    let d = direct().await;
+    table(&d, "c_rtt", 100, true).await;
+    let c = p.client().await;
+    for id in 1..=12 {
+        c.query("SELECT v FROM c_rtt WHERE id = $1", &[&id])
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let fills = p.fills();
+    eprintln!("rtt {:?}, fills {fills}", p.app.shared.validator.rtt());
+    assert!(
+        fills <= 4,
+        "a 20 ms round trip made a cheap lookup look slow: {fills} of 12 filled"
+    );
+}
+
+/// A fill's query goes out in the same write as its snapshot read, so its time is measured
+/// from the snapshot's response, which already excludes the round trip. Subtracting the
+/// round trip again timed fills behind a 20 ms round trip at about 0 ms, and after a few
+/// fills a 10 ms statement counted as cheaper than min_query_time and stopped being cached.
+#[tokio::test(flavor = "multi_thread")]
+async fn fills_behind_a_slow_network_keep_their_query_time() {
+    let p = slow_proxy(Duration::from_millis(10), |c| {
+        c.cache.min_query_time = Duration::from_millis(3);
+    })
+    .await;
+    let d = direct().await;
+    table(&d, "c_rtt_fill", 100, true).await;
+    let q = "SELECT count(*) FROM c_rtt_fill t, generate_series(1, 4000 + $1) g WHERE g % 7 <> t.id % 7";
+    let started = std::time::Instant::now();
+    d.query(q, &[&0i32]).await.unwrap();
+    let direct_time = started.elapsed();
+    let c = p.client().await;
+    let st = c.prepare(q).await.unwrap();
+    // The first run is timed, not filled; every later variant should be a fill.
+    for v in 1..=12i32 {
+        c.query(&st, &[&v]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let fills = p.fills();
+    eprintln!("query {direct_time:?} direct, {fills} of 11 variants filled");
+    assert!(
+        direct_time >= Duration::from_millis(5),
+        "test query too fast: {direct_time:?}"
+    );
+    assert!(fills >= 10, "only {fills} of 11 variants were filled");
+}
+
+/// A cache check reads the changelog through its index, whatever the changelog's size.
+/// validate() plans generically, and the generic plan for "any entry newer than the
+/// snapshot" used to be a sequential scan: every check read every entry, so checks got
+/// slower the more a busy table had been written within changelog.retention.
+#[tokio::test(flavor = "multi_thread")]
+async fn validation_does_not_scan_the_changelog() {
+    let dsn = isolated_db("shadow_changelog_size").await;
+    let mut c = connect_dsn(&dsn).await;
+    table(&c, "c_big_log", 10, true).await;
+    c.batch_execute(
+        "TRUNCATE pgshadow.changelog;
+         INSERT INTO pgshadow.changelog (rel, xid) SELECT 1, g::text::xid8 FROM generate_series(1, 200000) g;
+         ANALYZE pgshadow.changelog;",
+    )
+    .await
+    .unwrap();
+    // The proxy's check connections create the boot token settings_hash() needs.
+    c.batch_execute("SELECT pgshadow.boot_token()")
+        .await
+        .unwrap();
+    let tx = c.transaction().await.unwrap();
+    let valid: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM (SELECT st.fp, pgshadow.catalog_epoch() AS ep, pgshadow.settings_hash() AS sh,
+                                          pg_current_snapshot()::text AS snap
+                                   FROM pgshadow.rel_state('public.c_big_log'::regclass) st) x,
+                 LATERAL pgshadow.validate(ARRAY[1], ARRAY['public.c_big_log'::regclass::oid], ARRAY[x.fp], ARRAY[x.snap],
+                                           ARRAY[current_user::text], ARRAY[NULL::text], ARRAY['c_big_log'],
+                                           ARRAY['\"$user\", public'], ARRAY[x.ep], ARRAY[x.sh], ARRAY[''], x.sh) v
+             WHERE v.valid",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let scanned: i64 = tx
+        .query_one(
+            "SELECT seq_tup_read FROM pg_stat_xact_user_tables WHERE relid = 'pgshadow.changelog'::regclass",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    tx.commit().await.unwrap();
+    assert_eq!(valid, 1, "the check itself should pass");
+    assert!(
+        scanned < 1000,
+        "a cache check read {scanned} changelog entries sequentially"
+    );
+}
+
+/// 16 clients run 10 hits each of one cached GROUP BY on `name`. Returns the mean hit time.
+async fn concurrent_hits(p: std::sync::Arc<Proxy>, name: &str) -> Duration {
+    let d = direct().await;
+    table(&d, name, 100, true).await;
+    let q = format!("SELECT grp, sum(v) FROM {name} GROUP BY grp ORDER BY grp");
+    let c = p.client().await;
+    c.query(&q, &[]).await.unwrap();
+    p.wait_fills(1).await;
+    let hits_before = p.hits();
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let (p, q) = (p.clone(), q.clone());
+        tasks.push(tokio::spawn(async move {
+            let c = p.client().await;
+            let st = c.prepare(&q).await.unwrap();
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                c.query(&st, &[]).await.unwrap();
+            }
+            started.elapsed() / 10
+        }));
+    }
+    let mut total = Duration::ZERO;
+    for t in tasks {
+        total += t.await.unwrap();
+    }
+    let hits = p.hits() - hits_before;
+    assert!(hits >= 150, "expected hits, got {hits}");
+    total / 16
+}
+
+/// Behind a 20 ms round trip, a hit costs one round trip to Postgres, also with many
+/// clients at once: check batches are pipelined, so hits don't wait for a check
+/// connection to come back first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hits_take_one_round_trip_behind_a_slow_network() {
+    let p = std::sync::Arc::new(slow_proxy(Duration::from_millis(10), |_| {}).await);
+    let rtt = p.app.shared.validator.rtt();
+    let mean = concurrent_hits(p.clone(), "c_rtt_hits").await;
+    let depth = p.app.shared.validator.pipeline_depth();
+    eprintln!("rtt {rtt:?}, mean hit {mean:?}, pipeline depth {depth}");
+    assert!(depth > 1, "expected pipelined checks at {rtt:?}");
+    assert!(
+        mean < rtt * 3 / 2,
+        "a hit took {mean:?} at a round trip of {rtt:?}"
+    );
+}
+
+/// Next to Postgres, checks aren't pipelined: small batches would each pay the fixed
+/// cost of a check, where waiting for the previous batch costs less.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checks_are_not_pipelined_on_a_fast_network() {
+    let p = std::sync::Arc::new(proxy().await);
+    // The first ping lands within a second of startup.
+    for _ in 0..50 {
+        if !p.app.shared.validator.rtt().is_zero() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let rtt = p.app.shared.validator.rtt();
+    concurrent_hits(p.clone(), "c_fast_hits").await;
+    let depth = p.app.shared.validator.pipeline_depth();
+    eprintln!("rtt {rtt:?}, pipeline depth {depth}");
+    assert_eq!(depth, 1, "pipelined at a round trip of {rtt:?}");
+}
+
+/// Behind a 20 ms round trip, a miss costs one round trip to Postgres: the fill's
+/// snapshot travels with the query instead of in a round trip of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_takes_one_round_trip_behind_a_slow_network() {
+    let p = slow_proxy(Duration::from_millis(10), |c| {
+        c.cache.table_state_ttl = Duration::from_secs(30);
+    })
+    .await;
+    let rtt = p.app.shared.validator.rtt();
+    let d = direct().await;
+    table(&d, "c_rtt_miss", 100, true).await;
+    let c = p.client().await;
+    let st = c
+        .prepare("SELECT count(*), sum(v) FROM c_rtt_miss WHERE id > $1")
+        .await
+        .unwrap();
+    // The first fill also reads table state and checks names; later ones reuse both.
+    c.query(&st, &[&0i32]).await.unwrap();
+    p.wait_fills(1).await;
+    let mut times = Vec::new();
+    for id in 1..=5i32 {
+        let started = std::time::Instant::now();
+        c.query(&st, &[&id]).await.unwrap();
+        times.push(started.elapsed());
+    }
+    p.wait_fills(6).await;
+    times.sort();
+    let median = times[2];
+    eprintln!("rtt {rtt:?}, miss times {times:?}");
+    assert!(
+        median < rtt * 3 / 2,
+        "a miss took {median:?} at a round trip of {rtt:?}"
+    );
 }

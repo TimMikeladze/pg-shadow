@@ -33,6 +33,28 @@ use crate::observe::Stats;
 use crate::protocol::{self, Frame, FrameReader};
 use crate::validator::{Validator, Verdict};
 
+/// Checks of a statement's cached results that must have run before it can be paused for
+/// `invalidation_cooldown`. Right after startup most results are still being filled and
+/// get few hits, so one write can fail most of the first checks: on Fly, a report with 50
+/// parameter variants under 10 UPDATEs/s was paused after 29 checks (27 invalid) and
+/// passed through for the rest of the run, while 87% of its reads hit once warm. At 100
+/// checks the round-trip rule below still paused it against Neon under 1 UPDATE/s.
+const COOLDOWN_MIN_CHECKS: u32 = 500;
+
+/// Whether a statement's checks fail often enough to stop caching it for a while: over 80%
+/// of them, or often enough that the round trips spent on failed checks (each is followed
+/// by the query itself) exceed the statement time the hits saved. The second rule matters
+/// when Postgres is far away: against Neon 24 ms away, a 9 ms report under 10 UPDATEs/s
+/// hit 22% of the time and ran at 454 tps through pgshadow against 639 direct.
+/// `exec_micros` is the statement's average time on Postgres, 0 when it was never timed.
+fn mostly_invalid(valid: u32, invalid: u32, rtt_micros: f64, exec_micros: f64) -> bool {
+    if valid + invalid < COOLDOWN_MIN_CHECKS {
+        return false;
+    }
+    invalid > 4 * valid
+        || (exec_micros > 0.0 && invalid as f64 * rtt_micros > valid as f64 * exec_micros)
+}
+
 // ---- state shared by all sessions ----------------------------------------------
 
 /// Per-statement history, used to skip caching where it does not pay off.
@@ -110,7 +132,18 @@ impl Shared {
         // A statement whose cached results are nearly always invalid (its tables change
         // constantly) costs more to cache than it saves: pause it for a while.
         let cooldown = self.cfg.cache.invalidation_cooldown;
-        if !cooldown.is_zero() && t.invalid >= 20 && t.invalid > 4 * t.valid {
+        let rtt = self.validator.rtt().as_micros() as f64;
+        let exec = if t.samples > 0 { t.ewma_micros } else { 0.0 };
+        if !cooldown.is_zero() && mostly_invalid(t.valid, t.invalid, rtt, exec) {
+            tracing::info!(
+                statement = format!("{sql_hash:016x}"),
+                valid = t.valid,
+                invalid = t.invalid,
+                avg_ms = exec / 1000.0,
+                rtt_ms = rtt / 1000.0,
+                pause_secs = cooldown.as_secs(),
+                "statement's cached results keep failing their checks; not caching it for a while"
+            );
             t.cooldown_until = Some(Instant::now() + cooldown);
             t.valid = 0;
             t.invalid = 0;
@@ -121,18 +154,26 @@ impl Shared {
         }
     }
 
-    /// Reason to not cache this statement, from its history.
+    /// Reason to not cache this statement, from its history. With a min_query_time, a
+    /// statement is run and timed once before it can be cached, and is cached only while
+    /// its average stays at or above the threshold: a cheap statement never enters the
+    /// cache (a cached one would pay for a check on every hit).
     fn policy_skip(&self, sql_hash: u64) -> Option<&'static str> {
+        let min = self.cfg.cache.min_query_time.as_micros() as f64;
         let mut m = self.timing.lock();
-        let t = m.get_mut(&sql_hash)?;
+        let Some(t) = m.get_mut(&sql_hash) else {
+            return (min > 0.0).then_some("not timed yet");
+        };
         if let Some(until) = t.cooldown_until {
             if Instant::now() < until {
                 return Some("frequently invalidated");
             }
             t.cooldown_until = None;
         }
-        let min = self.cfg.cache.min_query_time.as_micros() as f64;
-        if t.samples >= 3 && t.ewma_micros < min {
+        if min > 0.0 && t.samples == 0 {
+            return Some("not timed yet");
+        }
+        if t.ewma_micros < min {
             return Some("faster than a cache check");
         }
         None
@@ -342,6 +383,8 @@ impl Capture {
 
 struct Done {
     response: Option<Bytes>,
+    /// Time from sending the query to the end of its response, minus the measured
+    /// round trip to Postgres: an estimate of the time Postgres spent on it.
     elapsed: Duration,
 }
 
@@ -559,6 +602,11 @@ const FP_SQL: &str = "SELECT current_user::pg_catalog.text, session_user::pg_cat
 const TXN_SQL: &str =
     "SELECT (pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL)::pg_catalog.text, \
      pg_catalog.current_setting('transaction_isolation')";
+
+/// The fill's snapshot, taken on the client's connection right before its query. Built-in
+/// functions only, so it needs no privileges and cannot fail in a healthy transaction.
+const SNAPSHOT_SQL: &str = "SELECT pg_catalog.pg_current_snapshot()::pg_catalog.text, \
+     pg_catalog.pg_is_in_recovery()::pg_catalog.text";
 
 /// Extended-protocol messages running one of the proxy's own queries on the client's
 /// session, without touching the client's unnamed statement or portal.
@@ -901,6 +949,27 @@ impl Session {
                 && matches!(st.status, b'I' | b'T')
                 && st.pending == 0)
             {
+                return Ok(());
+            }
+            st.fp_refreshing = true;
+            st.fp_refresh_gen = self.sh.validator.settings_generation();
+        }
+        self.push_unit(Up::Swallow {
+            fx: UnitEffects::default(),
+            frames: Vec::new(),
+            kind: SwallowKind::Fingerprint,
+        });
+        self.write_up(&our_query(FP_SQL, &[])).await
+    }
+
+    /// Queue a re-read of the session's settings right behind what was just sent, in the
+    /// same round trip. A forwarded read marks the settings stale (it could have run user
+    /// code); without this, the next request that uses the cache would first spend a
+    /// round trip re-reading them.
+    async fn refresh_fingerprint_behind(&mut self) -> std::io::Result<()> {
+        {
+            let mut st = self.st.lock();
+            if st.fp_refreshing || !matches!(st.status, b'I' | b'T') {
                 return Ok(());
             }
             st.fp_refreshing = true;
@@ -1406,8 +1475,10 @@ impl Session {
                         self.sh.record_check(cls.shape, false);
                         self.sh.store.remove(key);
                         if meta {
-                            // A table changed (not just its data): re-read table state.
+                            // A table changed (not just its data): re-read table state, and
+                            // the epoch and settings the next fills record.
                             self.sh.validator.forget_table_states();
+                            self.sh.validator.refresh_context();
                         }
                     }
                     Verdict::Failed => Stats::inc(&self.sh.stats.check_failed),
@@ -1556,23 +1627,25 @@ impl Session {
             }
             other => other,
         };
-        // 2. Snapshot, catalog epoch and settings, from the proxy's connection, before the
-        //    query is sent; and that no name the query uses is taken over by a user object.
+        // 2. Catalog epoch and settings hash, read on the proxy's connection before the
+        //    query is sent (the latest values, at most a second old: anything that changed
+        //    since fails the entry's first check); and that no name the query uses is
+        //    taken over by a user object. The snapshot comes in step 3.
         let ready = match deps {
-            Ok(d) => match self.sh.validator.fill_context().await {
+            Ok(d) => match self.sh.validator.fill_base().await {
                 None => Err("could not take snapshot (or server is a standby)"),
                 Some(_) if fp.gen != self.sh.validator.settings_generation() => {
                     self.st.lock().fp_stale = true;
                     Err("server settings changed")
                 }
-                Some(ctx) => {
+                Some(base) => {
                     match self
                         .sh
                         .validator
-                        .any_shadowed(&ctx.epoch, &c.functions, &c.operators, &c.types)
+                        .any_shadowed(&base.0, &c.functions, &c.operators, &c.types)
                         .await
                     {
-                        Some(false) => Ok((d, ctx)),
+                        Some(false) => Ok((d, base)),
                         Some(true) => {
                             Err("uses a name a user-defined function, operator or type shares")
                         }
@@ -1582,7 +1655,7 @@ impl Session {
             },
             Err(e) => Err(e),
         };
-        let (deps, ctx) = match ready {
+        let (deps, (epoch, settings)) = match ready {
             Ok(x) => x,
             Err(reason) => {
                 // Not cacheable after all: just run it.
@@ -1616,7 +1689,8 @@ impl Session {
             }
         }
         // 3. Inside a transaction: whether it has written (by any route) and its isolation
-        //    level, asked right before the query (pipelined: no added latency).
+        //    level. And the snapshot, on the client's own connection. Both are pipelined
+        //    with the query, in the same round trip, and run right before it.
         let txn_rx = if self.st.lock().status == b'T' {
             Some(
                 self.swallow(our_query(TXN_SQL, &[]), UnitEffects::default())
@@ -1625,6 +1699,9 @@ impl Session {
         } else {
             None
         };
+        let snap_rx = self
+            .swallow(our_query(SNAPSHOT_SQL, &[]), UnitEffects::default())
+            .await?;
 
         let mut capture = Capture {
             buf: BytesMut::new(),
@@ -1643,6 +1720,7 @@ impl Session {
             prefix,
         )
         .await?;
+        self.refresh_fingerprint_behind().await?;
 
         let sh = self.sh.clone();
         let st = self.st.clone();
@@ -1659,9 +1737,31 @@ impl Session {
                     None => false,
                 },
             };
+            // NULL or an error (aborted transaction) or recovery: don't store.
+            let snapshot = snap_rx.await.ok().and_then(|f| {
+                let rows = rows_of(&f)?;
+                let row = rows.first()?;
+                match (row.first()?, row.get(1)?) {
+                    (Some(snap), Some(recovery)) if recovery == "false" => Some(snap.clone()),
+                    _ => None,
+                }
+            });
             let done = done_rx.await.ok();
-            let outcome = if txn_ok {
-                finish_fill(&sh, deps, &fp, ctx, done, request, key, compare, &cls)
+            let outcome = if let (true, Some(snapshot)) = (txn_ok, snapshot.as_ref()) {
+                let ctx = crate::validator::FillContext {
+                    snapshot: snapshot.clone(),
+                    epoch,
+                    settings,
+                };
+                finish_fill(&sh, deps, &fp, ctx, done, request, key, compare, &cls).await
+            } else if txn_ok {
+                sh.stats
+                    .bypass("could not take snapshot (or server is a standby)");
+                (
+                    "miss",
+                    "could not take snapshot",
+                    done.map_or(0, |d| d.elapsed.as_micros() as u64),
+                )
             } else {
                 sh.stats
                     .bypass("transaction has written or is not READ COMMITTED");
@@ -1731,7 +1831,7 @@ fn table_deps(
 /// Decide whether a fresh result can be stored (or, in verify mode, whether it matches).
 /// Returns (outcome, reason, postgres micros) for the log line.
 #[allow(clippy::too_many_arguments)]
-fn finish_fill(
+async fn finish_fill(
     sh: &Shared,
     tables: Vec<TableDep>,
     fp: &SessionFp,
@@ -1778,6 +1878,13 @@ fn finish_fill(
             if same_result(&cached.response, &entry.response) {
                 Stats::inc(&sh.stats.verify_ok);
                 ("verify", "match", micros)
+            } else if sh.validator.check(cached).await != Verdict::Valid {
+                // A write committed after the cached snapshot, possibly between the hit's
+                // validation and the re-run, so the re-run may have seen it. Only a cached
+                // result that still validates after the re-run is a real mismatch.
+                Stats::inc(&sh.stats.verify_raced);
+                sh.store.remove(key);
+                ("verify", "raced with a write", micros)
             } else {
                 Stats::inc(&sh.stats.verify_mismatch);
                 sh.store.remove(key);
@@ -2007,7 +2114,15 @@ async fn upstream_reader(
                 if !batch.is_empty() {
                     write_client(&client_w, &batch.split()).await?;
                 }
-                let elapsed = started.max(prev_end).elapsed();
+                // Without the network round trip, so min_query_time compares the time
+                // Postgres spent, not the distance to it. A request pipelined behind
+                // another one (a fill behind its snapshot read, or a client's pipeline) is
+                // timed from the previous response, which already excludes the round trip.
+                let elapsed = if prev_end > started {
+                    prev_end.elapsed()
+                } else {
+                    started.elapsed().saturating_sub(sh.validator.rtt())
+                };
                 if let Some(k) = timing_key {
                     if !had_error {
                         sh.record_time(k, elapsed);
@@ -2066,6 +2181,23 @@ async fn upstream_reader(
 mod tests {
     use super::*;
     use bytes::BufMut;
+
+    #[test]
+    fn cooldown_needs_enough_checks() {
+        let (near, far) = (600.0, 24_000.0); // round trips: Fly, Neon from another region
+                                             // warm-up: one write failed most of the first checks
+        assert!(!mostly_invalid(2, 27, near, 9_000.0));
+        assert!(!mostly_invalid(50, 50, far, 9_000.0));
+        assert!(!mostly_invalid(150, 450, near, 9_000.0));
+        assert!(mostly_invalid(50, 450, near, 9_000.0));
+        assert!(mostly_invalid(0, 500, near, 0.0));
+        assert!(!mostly_invalid(500, 500, near, 9_000.0));
+        // far away, a failed check's round trip costs more than a hit saves
+        assert!(mostly_invalid(220, 780, far, 9_000.0));
+        assert!(!mostly_invalid(900, 100, far, 9_000.0));
+        // never timed (min_query_time = 0): only the 80% rule
+        assert!(!mostly_invalid(220, 780, far, 0.0));
+    }
 
     #[test]
     fn result_comparison_ignores_row_order_only() {

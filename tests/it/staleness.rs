@@ -30,6 +30,12 @@ async fn no_stale_reads_under_concurrent_writes() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    // Longest pause between a writer's writes. Against a distant database, raise it so
+    // reads can still hit between writes (every write invalidates the table).
+    let max_pause: u64 = std::env::var("PGSHADOW_STALENESS_WRITE_PAUSE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     // Keep caching on even though this table is written constantly.
     let p = Arc::new(proxy_with(|c| c.cache.invalidation_cooldown = Duration::ZERO).await);
     let d = direct().await;
@@ -118,7 +124,7 @@ async fn no_stale_reads_under_concurrent_writes() {
                     }
                 }
                 n += 1;
-                let pause = rand::thread_rng().gen_range(0..15);
+                let pause = rand::thread_rng().gen_range(0..max_pause);
                 tokio::time::sleep(Duration::from_millis(pause)).await;
             }
             n
@@ -168,17 +174,27 @@ async fn no_stale_reads_under_concurrent_writes() {
     }
 
     let log = log.lock();
+    // Per row: acknowledgement times in order, with the running max value, so each
+    // read is one binary search (long runs log millions of reads).
+    let mut by_row: Vec<Vec<(Instant, i64)>> = vec![Vec::new(); ROWS as usize];
+    for (at, row, v) in &log.writes {
+        by_row[*row as usize - 1].push((*at, *v));
+    }
+    for w in &mut by_row {
+        w.sort_by_key(|(at, _)| *at);
+        let mut max = 0;
+        for (_, v) in w.iter_mut() {
+            max = max.max(*v);
+            *v = max;
+        }
+    }
     let mut violations = Vec::new();
     for (started, values) in &log.reads {
         for (i, observed) in values.iter().enumerate() {
             let id = i as i32 + 1;
-            let must_see = log
-                .writes
-                .iter()
-                .filter(|(at, row, _)| *row == id && at < started)
-                .map(|(_, _, v)| *v)
-                .max()
-                .unwrap_or(0);
+            let w = &by_row[i];
+            let n = w.partition_point(|(at, _)| at < started);
+            let must_see = if n == 0 { 0 } else { w[n - 1].1 };
             if *observed < must_see {
                 violations.push(format!("row {id}: read {observed}, but {must_see} was committed before the read started"));
             }

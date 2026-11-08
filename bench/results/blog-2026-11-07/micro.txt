@@ -1,0 +1,5 @@
+full classify (unique text):     13.0 us/query
+pg_query::parse only:              7.0 us/query
+pg_query::fingerprint only:        1.4 us/query
+serde_json::to_value of tree:      2.7 us/query
+memoized classify (same text):    0.01 us/query

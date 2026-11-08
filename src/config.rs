@@ -151,8 +151,10 @@ pub struct Cache {
     /// is picked up within this time; validation never relies on it.
     #[serde(deserialize_with = "de_duration")]
     pub table_state_ttl: Duration,
-    /// Statements whose cached results are nearly always invalid (their tables change
-    /// constantly) stop being cached for this long. 0 disables the pause.
+    /// Statements whose cached results are mostly invalid (their tables change
+    /// constantly) stop being cached for this long. After at least 500 checks: over 80%
+    /// failed, or failed checks cost more round trips than the hits saved statement time.
+    /// 0 disables the pause.
     #[serde(deserialize_with = "de_duration")]
     pub invalidation_cooldown: Duration,
 }

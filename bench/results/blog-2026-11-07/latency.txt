@@ -1,0 +1,3 @@
+direct    prepared pk lookup     90 us   simple SELECT 1     98 us
+pgshadow  prepared pk lookup    123 us   simple SELECT 1    125 us
+proxy rss after latency run:  13616 KB

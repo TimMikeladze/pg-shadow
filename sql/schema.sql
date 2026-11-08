@@ -174,9 +174,14 @@ BEGIN
            bool_and(t.tgenabled = 'A')
       INTO trig, trig_on FROM pg_trigger t WHERE t.tgrelid = p_rel AND t.tgname = 'pgshadow_capture';
     ht := pgshadow.hypertable_fp(p_rel);
-    cols := (SELECT string_agg(a.attnum || ':' || a.xmin::text || ':' || coalesce(pgshadow.type_fp(a.atttypid), '!'), ','
+    -- Built-in scalar types inline (what type_fp returns for them), type_fp for the rest.
+    cols := (SELECT string_agg(a.attnum || ':' || a.xmin::text || ':' ||
+                               CASE WHEN ty.oid < 16384 AND ty.typtype IN ('b', 'p') AND ty.typelem = 0
+                                    THEN ty.oid::text || '@' || ty.xmin::text
+                                    ELSE coalesce(pgshadow.type_fp(a.atttypid), '!') END, ','
                                ORDER BY a.attnum)
-               FROM pg_attribute a WHERE a.attrelid = p_rel AND a.attnum > 0);
+               FROM pg_attribute a LEFT JOIN pg_type ty ON ty.oid = a.atttypid
+              WHERE a.attrelid = p_rel AND a.attnum > 0);
     fp := concat_ws('|', c.x, c.relkind::text, c.relrowsecurity, c.relhassubclass, c.relispartition, trig, ht, cols,
           (SELECT count(*) FROM pg_inherits i WHERE i.inhrelid = p_rel));
     eligible := false;
@@ -216,12 +221,19 @@ END $$;
 -- Two index lookups: transactions that started after the snapshot, and those that
 -- were in progress when it was taken. Also invalid if trimming may have removed
 -- an entry the snapshot could not see.
--- (No SET clause and fully qualified names, so the planner can inline it.)
+-- The first reads the table's newest entry rather than EXISTS (... xid >= xmax): validate() plans with
+-- force_generic_plan, and for EXISTS over an inequality on a parameter the generic plan
+-- is a sequential scan of the whole changelog that expects to stop early. On a hit
+-- nothing matches, so every check read every entry. ORDER BY xid DESC LIMIT 1 is one
+-- backward probe of the (rel, xid) index under any plan.
+-- validate() has the same expression written out; keep the two identical.
+-- (No SET clause and fully qualified names, so it can be called from any search_path.)
 CREATE OR REPLACE FUNCTION pgshadow.changed_since(p_rel oid, p_snap pg_snapshot) RETURNS boolean
 LANGUAGE sql STABLE AS $$
-    SELECT EXISTS (SELECT 1 FROM pgshadow.changelog c
-                   WHERE c.rel OPERATOR(pg_catalog.=) p_rel
-                     AND c.xid OPERATOR(pg_catalog.>=) pg_catalog.pg_snapshot_xmax(p_snap))
+    SELECT coalesce((SELECT c.xid FROM pgshadow.changelog c
+                     WHERE c.rel OPERATOR(pg_catalog.=) p_rel
+                     ORDER BY c.xid DESC LIMIT 1)
+                    OPERATOR(pg_catalog.>=) pg_catalog.pg_snapshot_xmax(p_snap), false)
         OR EXISTS (SELECT 1 FROM pgshadow.changelog c
                    WHERE c.rel OPERATOR(pg_catalog.=) p_rel
                      AND c.xid OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT pg_catalog.pg_snapshot_xip(p_snap))))
@@ -307,23 +319,22 @@ END $$;
 -- table changes are tracked per table, and creating tables must not invalidate.)
 CREATE OR REPLACE FUNCTION pgshadow.catalog_epoch() RETURNS text
 LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    f text; o text; t text; c text; l text;
 BEGIN
-    SELECT md5(coalesce(string_agg(p.oid::text || ':' || p.xmin::text, ',' ORDER BY p.oid), '')) INTO f
-      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-     WHERE p.oid >= 16384 AND n.nspname NOT IN ('pgshadow') AND n.nspname !~ '^pg_(toast_)?temp_';
-    SELECT md5(coalesce(string_agg(op.oid::text || ':' || op.xmin::text, ',' ORDER BY op.oid), '')) INTO o
-      FROM pg_operator op WHERE op.oid >= 16384;
-    SELECT md5(coalesce(string_agg(ty.oid::text || ':' || ty.xmin::text, ',' ORDER BY ty.oid), '')) INTO t
-      FROM pg_type ty JOIN pg_namespace n ON n.oid = ty.typnamespace
-     WHERE ty.oid >= 16384 AND ty.typrelid = 0 AND ty.typcategory <> 'A'
-       AND n.nspname !~ '^pg_(toast_)?temp_';
-    SELECT md5(coalesce(string_agg(ca.oid::text || ':' || ca.xmin::text, ',' ORDER BY ca.oid), '')) INTO c
-      FROM pg_cast ca WHERE ca.oid >= 16384;
-    SELECT md5(coalesce(string_agg(co.oid::text || ':' || co.xmin::text, ',' ORDER BY co.oid), '')) INTO l
-      FROM pg_collation co WHERE co.oid >= 16384;
-    RETURN md5(concat_ws('|', f, o, t, c, l));
+    -- One statement: it runs on every check, and each statement costs a round through SPI.
+    RETURN md5(concat_ws('|',
+        (SELECT md5(coalesce(string_agg(p.oid::text || ':' || p.xmin::text, ',' ORDER BY p.oid), ''))
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE p.oid >= 16384 AND n.nspname NOT IN ('pgshadow') AND n.nspname !~ '^pg_(toast_)?temp_'),
+        (SELECT md5(coalesce(string_agg(op.oid::text || ':' || op.xmin::text, ',' ORDER BY op.oid), ''))
+           FROM pg_operator op WHERE op.oid >= 16384),
+        (SELECT md5(coalesce(string_agg(ty.oid::text || ':' || ty.xmin::text, ',' ORDER BY ty.oid), ''))
+           FROM pg_type ty JOIN pg_namespace n ON n.oid = ty.typnamespace
+          WHERE ty.oid >= 16384 AND ty.typrelid = 0 AND ty.typcategory <> 'A'
+            AND n.nspname !~ '^pg_(toast_)?temp_'),
+        (SELECT md5(coalesce(string_agg(ca.oid::text || ':' || ca.xmin::text, ',' ORDER BY ca.oid), ''))
+           FROM pg_cast ca WHERE ca.oid >= 16384),
+        (SELECT md5(coalesce(string_agg(co.oid::text || ':' || co.xmin::text, ',' ORDER BY co.oid), ''))
+           FROM pg_collation co WHERE co.oid >= 16384)));
 END $$;
 
 -- Settings that change what a query returns, as configured for the server (the proxy's
@@ -480,8 +491,18 @@ BEGIN
         SELECT d.rel, st.eligible, st.fp
         FROM (SELECT DISTINCT rel FROM t) d CROSS JOIN LATERAL pgshadow.rel_state(d.rel) st
     ),
+    -- pgshadow.changed_since(), written out: as a function call it costs a SQL-function
+    -- invocation per table and snapshot (it is never inlined, it has subqueries).
     ch AS MATERIALIZED (
-        SELECT d.rel, d.snap, pgshadow.changed_since(d.rel, d.snap::pg_snapshot) AS changed
+        SELECT d.rel, d.snap,
+               coalesce((SELECT c.xid FROM pgshadow.changelog c
+                         WHERE c.rel = d.rel ORDER BY c.xid DESC LIMIT 1)
+                        >= pg_snapshot_xmax(d.snap::pg_snapshot), false)
+            OR EXISTS (SELECT 1 FROM pgshadow.changelog c
+                       WHERE c.rel = d.rel
+                         AND c.xid = ANY (ARRAY(SELECT pg_snapshot_xip(d.snap::pg_snapshot))))
+            OR (SELECT s.trimmed_through FROM pgshadow.state s) > pg_snapshot_xmin(d.snap::pg_snapshot)
+               AS changed
         FROM (SELECT DISTINCT rel, snap FROM t) d
     ),
     rv AS MATERIALIZED (

@@ -1,0 +1,59 @@
+NOTICE:  schema "early" does not exist, skipping
+NOTICE:  trigger "pgshadow_capture" for relation "public.t1" does not exist, skipping
+ok    writer in progress when cached: still valid (Postgres would not show it yet)
+ok    writer committed after the snapshot: invalid
+ok    fresh snapshot, nothing changed: valid
+ok    committed update: invalid
+ok    ALTER TABLE: invalid
+ok    trigger disabled: invalid
+ok    write with session_replication_role=replica: invalid
+ok    TRUNCATE: invalid
+ok    name now resolves to another table: invalid
+ok    same name, other search path unaffected: valid
+NOTICE:  drop cascades to table early.t1
+ok    schema created later on the search path: invalid
+NOTICE:  drop cascades to table app_late.t1
+ok    qualified reference: valid
+ok    qualified reference after a schema swap: invalid
+NOTICE:  drop cascades to table t1
+ok    user function created: invalid (catalog epoch)
+ok    role with SELECT: valid
+ok    schema USAGE revoked: invalid
+ok    SELECT revoked: invalid
+ok    in-progress write committed, then its log entry trimmed: invalid
+ok    fresh snapshot after trimming: valid
+ok    trim while an unrelated long transaction is open: still valid
+ok    row-level security: not eligible
+ok    enum label renamed: invalid
+ok    formatting setting changed by a config reload: invalid
+ok    search_path changed by a config reload: invalid
+NOTICE:  table "audit_par" does not exist, skipping
+ok    partition cannot be enabled
+NOTICE:  table "audit_parent" does not exist, skipping
+NOTICE:  table "audit_child" does not exist, skipping
+ok    inheritance child cannot be enabled
+NOTICE:  drop cascades to table audit_child
+NOTICE:  drop cascades to type mood_d
+NOTICE:  type "mood_d" does not exist, skipping
+NOTICE:  trigger "pgshadow_capture" for relation "public.t1" does not exist, skipping
+ok    composite attribute renamed: invalid
+ok    enum under domain under array renamed: invalid
+ok    enum rename by an older transaction: invalid
+NOTICE:  collation "public.zcoll" does not exist, skipping
+ok    user collation created: invalid (catalog epoch)
+ok    built-in function privileges changed: invalid
+ok    ... other functions unaffected
+ok    server rebooted (crash, failover, restore): invalid
+ok    unlogged table cannot be enabled
+NOTICE:  table "cc" does not exist, skipping
+ok    date/time casts: text column or unknown name could read the clock, timestamptz column not
+ok    user collation name is reported as shadowing
+NOTICE:  type "zz_ct" does not exist, skipping
+ok    volatile user cast reported
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function zz_cf(zz_ct)
+drop cascades to cast from zz_ct to integer
+NOTICE:  type "zz_ct" does not exist, skipping
+NOTICE:  view "vw1" does not exist, skipping
+ok    view: refused without an error
+validate() server time for one item (warm session): 0.435 ms

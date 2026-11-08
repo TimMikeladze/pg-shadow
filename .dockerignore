@@ -1,3 +1,5 @@
 target
 py_tests/__pycache__
 .git
+bench/results
+bench/.fly-bench

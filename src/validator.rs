@@ -6,7 +6,7 @@
 //! started after it was queued, so batching never makes a result older than a direct
 //! query would be.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -39,6 +39,9 @@ pub struct Validator {
     timeout: std::time::Duration,
     meta: TableStates,
     ctx_tx: mpsc::Sender<oneshot::Sender<Option<FillContext>>>,
+    /// The latest catalog epoch and settings hash read by the context worker.
+    ctx_latest: Arc<parking_lot::Mutex<Option<(String, String)>>>,
+    ctx_refresh: Arc<tokio::sync::Notify>,
     shadow_aux: Aux,
     shadow: parking_lot::Mutex<ShadowCache>,
     /// The database and server the check connections are on. Only sessions on the same
@@ -47,6 +50,52 @@ pub struct Validator {
     server: Arc<parking_lot::Mutex<Option<(String, String)>>>,
     generation: Arc<Generation>,
     clock_aux: Aux,
+    /// Round trip to Postgres in microseconds (see ping_worker), 0 until measured.
+    rtt_micros: Arc<AtomicU64>,
+    pipeline: Arc<Pipeline>,
+}
+
+/// How many check batches each check connection keeps in flight.
+///
+/// Pipelining saves the wait for the previous batch's round trip, but it splits one big
+/// batch into several small ones, and each batch pays a fixed cost in Postgres (about
+/// 0.2 ms). On a fast network that cost is the larger one: depth 4 on Fly (0.6 ms round
+/// trip) cut hit throughput by a third. So depth is round trip / (2 x batch execution
+/// time), clamped to 1..=MAX_PIPELINE, and 1 until both are measured.
+#[derive(Default)]
+struct Pipeline {
+    depth: AtomicUsize,
+    /// EWMA of batch round trip minus network round trip, for batches sent while nothing
+    /// else was in flight on their connection (otherwise they also waited for those).
+    exec_micros: AtomicU64,
+}
+
+impl Pipeline {
+    fn depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed).max(1)
+    }
+
+    fn observe(&self, batch_micros: u64, rtt_micros: u64) {
+        if rtt_micros == 0 {
+            return;
+        }
+        let sample = batch_micros
+            .saturating_sub(rtt_micros)
+            .max(MIN_BATCH_EXEC_MICROS);
+        let old = self.exec_micros.load(Ordering::Relaxed);
+        let exec = if old == 0 {
+            sample
+        } else {
+            (old * 7 + sample) / 8
+        };
+        self.exec_micros.store(exec, Ordering::Relaxed);
+        self.depth
+            .store(pipeline_depth(rtt_micros, exec), Ordering::Relaxed);
+    }
+}
+
+fn pipeline_depth(rtt_micros: u64, exec_micros: u64) -> usize {
+    ((rtt_micros / (2 * exec_micros.max(1))) as usize).clamp(1, MAX_PIPELINE)
 }
 
 /// State of one referenced table as seen by the proxy's connection.
@@ -135,6 +184,16 @@ const SHADOWED_SQL: &str = "SELECT pgshadow.catalog_epoch(), \
      pgshadow.shadowed($1::pg_catalog.text[], $2::pg_catalog.text[], $3::pg_catalog.text[])";
 const CLOCK_COLUMNS_SQL: &str =
     "SELECT pgshadow.clock_columns($1::pg_catalog.oid[], $2::pg_catalog.text[])";
+const PING_SQL: &str = "SELECT 1";
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const PING_WINDOW: usize = 8;
+/// Most check batches in flight per check connection.
+const MAX_PIPELINE: usize = 8;
+/// Floor for the measured batch execution time, so a noisy sample can't ask for deep
+/// pipelining on a fast network.
+const MIN_BATCH_EXEC_MICROS: u64 = 100;
+/// How often the context worker re-reads the catalog epoch and settings hash.
+const CONTEXT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl TableStates {
     async fn lookup(
@@ -250,6 +309,8 @@ impl Validator {
         let installed = Arc::new(AtomicBool::new(false));
         let server = Arc::new(parking_lot::Mutex::new(None));
         let generation = Arc::new(Generation::default());
+        let rtt_micros = Arc::new(AtomicU64::new(0));
+        let pipeline = Arc::new(Pipeline::default());
         for id in 0..cfg.check.connections {
             let rx = rx.clone();
             let cfg = cfg.clone();
@@ -258,8 +319,12 @@ impl Validator {
             let installed = installed.clone();
             let server = server.clone();
             let generation = generation.clone();
+            let (rtt, pipeline) = (rtt_micros.clone(), pipeline.clone());
             tokio::spawn(async move {
-                worker(id, cfg, tls, rx, connected, installed, server, generation).await
+                worker(
+                    id, cfg, tls, rx, connected, installed, server, generation, rtt, pipeline,
+                )
+                .await
             });
         }
         let meta = TableStates {
@@ -268,10 +333,18 @@ impl Validator {
             cache: parking_lot::Mutex::new(Default::default()),
         };
         let (ctx_tx, ctx_rx) = mpsc::channel(4096);
+        let ctx_latest = Arc::new(parking_lot::Mutex::new(None));
+        let ctx_refresh = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(context_worker(
             Aux::new(cfg, &tls, FILL_CONTEXT_SQL),
             ctx_rx,
             generation.clone(),
+            ctx_latest.clone(),
+            ctx_refresh.clone(),
+        ));
+        tokio::spawn(ping_worker(
+            Aux::new(cfg, &tls, PING_SQL),
+            rtt_micros.clone(),
         ));
         Arc::new(Self {
             tx,
@@ -280,12 +353,27 @@ impl Validator {
             timeout: cfg.check.timeout,
             meta,
             ctx_tx,
+            ctx_latest,
+            ctx_refresh,
             shadow_aux: Aux::new(cfg, &tls, SHADOWED_SQL),
             shadow: parking_lot::Mutex::new(ShadowCache::default()),
             server,
             generation,
             clock_aux: Aux::new(cfg, &tls, CLOCK_COLUMNS_SQL),
+            rtt_micros,
+            pipeline,
         })
+    }
+
+    /// Check batches each check connection currently keeps in flight (see Pipeline).
+    pub fn pipeline_depth(&self) -> usize {
+        self.pipeline.depth()
+    }
+
+    /// The network round trip to Postgres, measured with `SELECT 1` on a helper
+    /// connection: the fastest of the last few pings. Zero until the first one returns.
+    pub fn rtt(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.rtt_micros.load(Ordering::Relaxed))
     }
 
     /// Whether a session in this database, on the server that started at this time, can
@@ -312,6 +400,23 @@ impl Validator {
 
     /// Snapshot, catalog epoch and settings hash, read now on the proxy's connection.
     /// Concurrent fills share one round trip.
+    /// Catalog epoch and settings hash for a fill, as (epoch, settings): the latest values
+    /// the context worker read (at most CONTEXT_INTERVAL old), or a fresh read if there
+    /// are none yet. Any value read before the query runs will do: a change after it
+    /// fails the entry's first check, as it would with a fresh read.
+    pub async fn fill_base(&self) -> Option<(String, String)> {
+        if let Some(latest) = self.ctx_latest.lock().clone() {
+            return Some(latest);
+        }
+        self.fill_context().await.map(|c| (c.epoch, c.settings))
+    }
+
+    /// Re-read the epoch and settings now, e.g. after a check saw the catalog change.
+    pub fn refresh_context(&self) {
+        *self.ctx_latest.lock() = None;
+        self.ctx_refresh.notify_one();
+    }
+
     pub async fn fill_context(&self) -> Option<FillContext> {
         let (tx, rx) = oneshot::channel();
         self.ctx_tx.try_send(tx).ok()?;
@@ -422,6 +527,8 @@ async fn worker(
     installed: Arc<AtomicBool>,
     server: Arc<parking_lot::Mutex<Option<(String, String)>>>,
     generation: Arc<Generation>,
+    rtt: Arc<AtomicU64>,
+    pipeline: Arc<Pipeline>,
 ) {
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
@@ -484,60 +591,97 @@ async fn worker(
         connected.fetch_add(1, Ordering::Relaxed);
         tracing::info!(worker = id, "check connection ready");
 
+        // Up to pipeline.depth() batches in flight on this connection: Postgres runs them
+        // in turn, but a batch doesn't wait a whole round trip for the previous one to
+        // return. Each batch is still sent after all of its requests were queued.
+        let client = Arc::new(client);
+        let mut inflight: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
         loop {
-            // Take one request (waiting), then everything else already queued.
-            let mut batch = Vec::new();
-            {
-                let mut rx = rx.lock().await;
-                match rx.recv().await {
-                    Some(r) => batch.push(r),
-                    None => return,
-                }
-                while batch.len() < cfg.check.max_batch {
-                    match rx.try_recv() {
-                        Ok(r) => batch.push(r),
-                        Err(_) => break,
+            tokio::select! {
+                Some(done) = inflight.join_next(), if !inflight.is_empty() => {
+                    if !done.unwrap_or(false) {
+                        break; // connection lost
                     }
                 }
-            }
-            batch.retain(|r| !r.reply.is_closed()); // callers that timed out
-            if batch.is_empty() {
-                continue;
-            }
-            let started = Instant::now();
-            match run_batch(&client, &stmt, &batch).await {
-                Ok((results, settings)) => {
-                    if let Some(s) = settings {
-                        generation.observe(&s);
+                batch = take_batch(&rx, cfg.check.max_batch), if inflight.len() < pipeline.depth() => {
+                    let Some(mut batch) = batch else { return };
+                    batch.retain(|r| !r.reply.is_closed()); // callers that timed out
+                    if batch.is_empty() {
+                        continue;
                     }
-                    tracing::trace!(
-                        worker = id,
-                        items = batch.len(),
-                        micros = started.elapsed().as_micros() as u64,
-                        "check round"
-                    );
-                    for (r, (valid, meta_ok)) in batch.into_iter().zip(results) {
-                        let v = if valid {
-                            Verdict::Valid
-                        } else {
-                            Verdict::Invalid { meta: !meta_ok }
-                        };
-                        let _ = r.reply.send(v);
-                    }
-                }
-                Err(e) => {
-                    for r in batch {
-                        let _ = r.reply.send(Verdict::Failed);
-                    }
-                    tracing::warn!(worker = id, error = %e, "check round failed");
-                    if client.is_closed() {
-                        break;
-                    }
+                    let (client, stmt, generation) = (client.clone(), stmt.clone(), generation.clone());
+                    // Only a batch with nothing ahead of it measures execution time.
+                    let timing = inflight.is_empty().then(|| (rtt.clone(), pipeline.clone()));
+                    inflight.spawn(async move {
+                        run_and_reply(id, &client, &stmt, batch, &generation, timing).await
+                    });
                 }
             }
         }
+        while inflight.join_next().await.is_some() {}
         connected.fetch_sub(1, Ordering::Relaxed);
         tracing::warn!(worker = id, "check connection lost; reconnecting");
+    }
+}
+
+/// One request (waiting for it), then everything else already queued, up to `max`.
+/// None when the queue is closed.
+async fn take_batch(rx: &Mutex<mpsc::Receiver<Request>>, max: usize) -> Option<Vec<Request>> {
+    let mut rx = rx.lock().await;
+    let mut batch = vec![rx.recv().await?];
+    while batch.len() < max {
+        match rx.try_recv() {
+            Ok(r) => batch.push(r),
+            Err(_) => break,
+        }
+    }
+    Some(batch)
+}
+
+/// Run one batch and answer its requests. False if the connection is gone.
+async fn run_and_reply(
+    id: usize,
+    client: &tokio_postgres::Client,
+    stmt: &tokio_postgres::Statement,
+    batch: Vec<Request>,
+    generation: &Generation,
+    timing: Option<(Arc<AtomicU64>, Arc<Pipeline>)>,
+) -> bool {
+    let started = Instant::now();
+    match run_batch(client, stmt, &batch).await {
+        Ok((results, settings)) => {
+            if let Some((rtt, pipeline)) = timing {
+                pipeline.observe(
+                    started.elapsed().as_micros() as u64,
+                    rtt.load(Ordering::Relaxed),
+                );
+            }
+            if let Some(s) = settings {
+                generation.observe(&s);
+            }
+            tracing::trace!(
+                worker = id,
+                items = batch.len(),
+                micros = started.elapsed().as_micros() as u64,
+                "check round"
+            );
+            for (r, (valid, meta_ok)) in batch.into_iter().zip(results) {
+                let v = if valid {
+                    Verdict::Valid
+                } else {
+                    Verdict::Invalid { meta: !meta_ok }
+                };
+                let _ = r.reply.send(v);
+            }
+            true
+        }
+        Err(e) => {
+            for r in batch {
+                let _ = r.reply.send(Verdict::Failed);
+            }
+            tracing::warn!(worker = id, error = %e, "check round failed");
+            !client.is_closed()
+        }
     }
 }
 
@@ -545,17 +689,25 @@ async fn context_worker(
     aux: Aux,
     mut rx: mpsc::Receiver<oneshot::Sender<Option<FillContext>>>,
     generation: Arc<Generation>,
+    latest: Arc<parking_lot::Mutex<Option<(String, String)>>>,
+    refresh: Arc<tokio::sync::Notify>,
 ) {
-    while let Some(first) = rx.recv().await {
-        let mut waiting = vec![first];
-        while let Ok(more) = rx.try_recv() {
-            waiting.push(more);
+    loop {
+        // Requests for a fresh read, or a periodic (or requested) refresh of `latest`.
+        let mut waiting = Vec::new();
+        tokio::select! {
+            first = rx.recv() => {
+                let Some(first) = first else { return };
+                waiting.push(first);
+                while let Ok(more) = rx.try_recv() {
+                    waiting.push(more);
+                }
+                waiting.retain(|w| !w.is_closed());
+            }
+            _ = tokio::time::sleep(CONTEXT_INTERVAL) => {}
+            _ = refresh.notified() => {}
         }
-        waiting.retain(|w| !w.is_closed());
-        if waiting.is_empty() {
-            continue;
-        }
-        // Every waiter queued before this round started, so the snapshot is taken after it
+        // Every waiter queued before this round started, so what it reads is read after it
         // asked, and before its query is sent.
         // All NULL during recovery: nothing is cached on a standby.
         let ctx = aux.query(&[]).await.and_then(|rows| {
@@ -569,6 +721,7 @@ async fn context_worker(
         if let Some(c) = &ctx {
             generation.observe(&c.settings);
         }
+        *latest.lock() = ctx.as_ref().map(|c| (c.epoch.clone(), c.settings.clone()));
         for w in waiting {
             let _ = w.send(ctx.clone());
         }
@@ -630,4 +783,55 @@ async fn run_batch(
     }
     // Entries with no tables never get a row and stay invalid (they are never created).
     Ok((out, current))
+}
+
+/// Keeps `rtt` at the fastest of the last PING_WINDOW `SELECT 1` round trips. The minimum
+/// filters out pings that queued behind a busy server; the window lets it follow a
+/// network that got slower.
+async fn ping_worker(aux: Aux, rtt: Arc<AtomicU64>) {
+    let mut recent = std::collections::VecDeque::with_capacity(PING_WINDOW);
+    let mut warm = false;
+    loop {
+        let started = Instant::now();
+        // The first query on a (re)opened connection also connects and prepares.
+        let fresh = !warm;
+        warm = aux.query(&[]).await.is_some();
+        if warm && !fresh {
+            if recent.len() == PING_WINDOW {
+                recent.pop_front();
+            }
+            recent.push_back(started.elapsed().as_micros() as u64);
+            rtt.store(min_micros(&recent), Ordering::Relaxed);
+            tokio::time::sleep(PING_INTERVAL).await;
+        } else if !warm {
+            tokio::time::sleep(PING_INTERVAL).await;
+        }
+    }
+}
+
+fn min_micros(recent: &std::collections::VecDeque<u64>) -> u64 {
+    recent.iter().copied().min().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_depth_follows_round_trip_over_execution_time() {
+        assert_eq!(pipeline_depth(600, 300), 1); // Fly, same region
+        assert_eq!(pipeline_depth(150, 200), 1); // same host
+        assert_eq!(pipeline_depth(24_000, 300), MAX_PIPELINE); // Neon from another region
+        assert_eq!(pipeline_depth(2_000, 250), 4);
+        let p = Pipeline::default();
+        assert_eq!(p.depth(), 1);
+        p.observe(500, 0); // no round trip measured yet
+        assert_eq!(p.depth(), 1);
+        p.observe(650, 600); // noisy sample: floored at MIN_BATCH_EXEC_MICROS
+        assert_eq!(p.depth(), 3);
+        for _ in 0..40 {
+            p.observe(1_000, 600);
+        }
+        assert_eq!(p.depth(), 1);
+    }
 }

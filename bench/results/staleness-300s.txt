@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/it/main.rs (target/release/deps/it-c4c3dd13ae91ce4e)
+
+running 1 test
+test staleness::no_stale_reads_under_concurrent_writes has been running for over 60 seconds
+staleness: 118458 writes, 1281037 reads, 916949 cache hits, 363334 fills, 363173 invalidated, 0 violations
+test staleness::no_stale_reads_under_concurrent_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 300.58s
+
+staleness exit=0
